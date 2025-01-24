@@ -36,6 +36,12 @@ type Config struct {
 	RetryInterval int  `json:"retry_interval"`
 	JustDownload  bool `json:"just_download"`
 	SilentMode    bool `json:"silent_mode"`
+	UseR2           bool   `json:"use_r2"`
+	R2BucketName    string `json:"r2_bucket_name"`
+	R2AccountID     string `json:"r2_account_id"`
+	R2AccessKey     string `json:"r2_access_key"`
+	R2SecretKey     string `json:"r2_secret_key"`
+	SkipLocal       bool   `json:"skip_local"`
 }
 
 // DefaultConfig returns a config instance populated with default values.
@@ -184,8 +190,47 @@ func main() {
 			fmt.Printf("Branch: %s\nStorage: %s\nNumberOfConcurrentConnections: %d\nAppend Filter Names to Folder: %t\nSkip SHA256 Check: %t\nToken: %s\n",
 				config.Branch, config.Storage, config.NumConnections, config.OneFolderPerFilter, config.SkipSHA, config.AuthToken)
 
+			var r2cfg *hfd.R2Config
+			if config.UseR2 {
+				// Load credentials from env
+				accountID := os.Getenv("R2_ACCOUNT_ID")
+				accessKey := os.Getenv("R2_WRITE_ACCESS_KEY_ID")
+				secretKey := os.Getenv("R2_WRITE_SECRET_ACCESS_KEY")
+
+				// Validate R2 configuration
+				if accountID == "" || accessKey == "" || secretKey == "" {
+					log.Fatal("R2 credentials not found in environment variables")
+				}
+
+				// Use account ID as bucket name if not specified
+				bucketName := config.R2BucketName
+				if bucketName == "" {
+					bucketName = accountID
+				}
+
+				r2cfg = &hfd.R2Config{
+					AccountID:       accountID,
+					AccessKeyID:     accessKey,
+					AccessKeySecret: secretKey,
+					BucketName:      bucketName,
+					Region:          "auto",
+				}
+			}
+
 			for i := 0; i < config.MaxRetries; i++ {
-				if err := hfd.DownloadModel(ModelOrDataSet, config.OneFolderPerFilter, config.SkipSHA, IsDataset, config.Storage, config.Branch, config.NumConnections, config.AuthToken, config.SilentMode); err != nil {
+				if err := hfd.DownloadModel(
+					ModelOrDataSet,          // model name
+					config.OneFolderPerFilter, // append filter to path
+					config.SkipSHA,          // skip SHA check
+					IsDataset,               // is dataset
+					config.Storage,          // local temp path
+					config.Branch,           // branch
+					config.NumConnections,   // concurrent connections
+					config.AuthToken,        // HF token
+					config.SilentMode,       // silent mode
+					r2cfg,                   // R2 config
+					config.SkipLocal,        // skipLocal - use SkipLocal flag
+				); err != nil {
 					fmt.Printf("Warning: attempt %d / %d failed, error: %s\n", i+1, config.MaxRetries, err)
 					time.Sleep(time.Duration(config.RetryInterval) * time.Second)
 					continue
@@ -224,6 +269,14 @@ func main() {
 	}
 
 	rootCmd.AddCommand(generateCmd)
+
+	// Add new flags
+	rootCmd.PersistentFlags().BoolVar(&config.UseR2, "r2", false, "Upload to Cloudflare R2")
+	rootCmd.PersistentFlags().StringVar(&config.R2BucketName, "r2-bucket", "", "R2 bucket name")
+	rootCmd.PersistentFlags().StringVar(&config.R2AccountID, "r2-account", "", "R2 account ID")
+	rootCmd.PersistentFlags().StringVar(&config.R2AccessKey, "r2-access-key", "", "R2 access key")
+	rootCmd.PersistentFlags().StringVar(&config.R2SecretKey, "r2-secret-key", "", "R2 secret key")
+	rootCmd.PersistentFlags().BoolVar(&config.SkipLocal, "skip-local", false, "Skip local storage when using R2")
 
 	if err := rootCmd.Execute(); err != nil {
 		log.Fatalln("Error:", err)

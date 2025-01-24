@@ -12,12 +12,27 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fatih/color"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"context"
+	"bytes"
+	// "crypto/md5"
+	// "encoding/base64"
+	"github.com/vbauerster/mpb/v8"
+	"github.com/vbauerster/mpb/v8/decor"
+	"bufio"
+	"net"
 )
 
 const (
@@ -29,6 +44,14 @@ const (
 	LfsDatasetResolverURL  = "https://huggingface.co/datasets/%s/resolve/%s/%s"
 	JsonModelsFileTreeURL  = "https://huggingface.co/api/models/%s/tree/%s/%s"
 	JsonDatasetFileTreeURL = "https://huggingface.co/api/datasets/%s/tree/%s/%s"
+	// Optimize for high-bandwidth uploads
+	streamBufferSize    = 128 * 1024 * 1024   // 128MB buffer
+	multipartThreshold  = 512 * 1024 * 1024   // 512MB threshold
+	chunkSize          = 128 * 1024 * 1024   // 128MB per chunk for faster uploads
+	maxConcurrent      = 256                  // More concurrent operations
+	bufferSize         = 64 * 1024 * 1024    // 64MB buffer size
+	maxRetries         = 3                    // Reduced retries for faster failure recovery
+	retryDelay         = 500 * time.Millisecond // Shorter retry delay
 )
 
 var (
@@ -36,7 +59,7 @@ var (
 	successColor   = color.New(color.FgHiGreen).SprintFunc()
 	warningColor   = color.New(color.FgYellow).SprintFunc()
 	errorColor     = color.New(color.FgRed).SprintFunc()
-	NumConnections = 5
+	NumConnections = 32  // Increased from 5 to 32
 	RequiresAuth   = false
 	AuthToken      = ""
 )
@@ -64,394 +87,250 @@ type hflfs struct {
 	PointerSize int    `json:"pointerSize"`
 }
 
-func DownloadModel(ModelDatasetName string, AppendFilterToPath bool, SkipSHA bool, IsDataset bool, DestinationBasePath string, ModelBranch string, concurrentConnections int, token string, silentMode bool) error {
-	NumConnections = concurrentConnections
-
-	// make sure we dont include dataset filter within folder creation
-	modelP := ModelDatasetName
-	HasFilter := false
-	if strings.Contains(modelP, ":") {
-		modelP = strings.Split(ModelDatasetName, ":")[0]
-		HasFilter = true
-	}
-	modelPath := path.Join(DestinationBasePath, strings.Replace(modelP, "/", "_", -1))
-	if token != "" {
-		RequiresAuth = true
-		AuthToken = token
-	}
-
-	if HasFilter && AppendFilterToPath { // for this feature, I'll just simple re-run the script and apply one filter at a time
-		filters := strings.Split(strings.Split(ModelDatasetName, ":")[1], ",")
-		for _, ff := range filters {
-			// create folders
-
-			ffpath := fmt.Sprintf("%s_f_%s", modelPath, ff)
-			err := os.MkdirAll(ffpath, os.ModePerm)
-			if err != nil {
-				if !silentMode {
-					fmt.Println(errorColor("Error:"), err)
-				}
-				return err
-			}
-			newModelDatasetName := fmt.Sprintf("%s:%s", modelP, ff)
-			err = processHFFolderTree(ffpath, IsDataset, SkipSHA, newModelDatasetName, ModelBranch, "", silentMode) // passing empty as foldername, because its the first root folder
-			if err != nil {
-				if !silentMode {
-					fmt.Println(errorColor("Error:"), err)
-				}
-				return err
-			}
-		}
-	} else {
-		err := os.MkdirAll(modelPath, os.ModePerm)
-		if err != nil {
-			if !silentMode {
-				fmt.Println(errorColor("Error:"), err)
-			}
-			return err
-		}
-		// ok we need to add some logic here now to analyze the model/dataset before we go into downloading
-
-		// get root path files and folders
-		err = processHFFolderTree(modelPath, IsDataset, SkipSHA, ModelDatasetName, ModelBranch, "", silentMode) // passing empty as foldername, because its the first root folder
-		if err != nil {
-			if !silentMode {
-				fmt.Println(errorColor("Error:"), err)
-			}
-			return err
-		}
-	}
-
-	return nil
+type R2Config struct {
+	AccountID       string
+	AccessKeyID     string
+	AccessKeySecret string
+	BucketName     string
+	Region         string // Usually "auto" for R2
 }
-func processHFFolderTree(ModelPath string, IsDataset bool, SkipSHA bool, ModelDatasetName string, Branch string, folderName string, silentMode bool) error {
-	JsonTreeVariable := JsonModelsFileTreeURL // we assume its Model first
-	RawFileURL := RawModelFileURL
-	LfsResolverURL := LfsModelResolverURL
-	AgreementURL := fmt.Sprintf(AgreementModelURL, ModelDatasetName)
-	HasFilter := false
-	var FilterBinFileString []string
-	originalDataSetName := ModelDatasetName // fix a bug where filters will be skipped when we call the function recursiley
-	if strings.Contains(ModelDatasetName, ":") && !IsDataset {
-		HasFilter = true
-		// remove the filtered content from Model Name
-		f := strings.Split(ModelDatasetName, ":")
-		ModelDatasetName = f[0]
-		FilterBinFileString = strings.Split(strings.ToLower(f[1]), ",")
-		if !silentMode {
-			fmt.Printf("\n%s", infoColor("Filter Has been applied, will include LFS Model Files that contains: ", FilterBinFileString))
-		}
-	}
-	if IsDataset {
-		JsonTreeVariable = JsonDatasetFileTreeURL // set this to true if it its set to Dataset
-		RawFileURL = RawDatasetFileURL
-		LfsResolverURL = LfsDatasetResolverURL
-		AgreementURL = fmt.Sprintf(AgreementDatasetURL, ModelDatasetName)
-	}
 
-	tempFolder := path.Join(ModelPath, folderName, "tmp")
-	// updated ver: 1.2.5; I cannot clear it if I'm trying to implement resume broken downloads based on a single file
-	// if _, err := os.Stat(tempFolder); err == nil { //clear it if it exists before for any reason
-	// 	err = os.RemoveAll(tempFolder)
-	// 	if err != nil {
-	// 		return err
-	// 	}
-	// }
-	err := os.MkdirAll(tempFolder, os.ModePerm)
-	if err != nil {
-		if !silentMode {
-			fmt.Println(errorColor("Error:", err))
-		}
-		return err
-	}
-	// updated ver: 1.2.5; I cannot clear it if I'm trying to implement resume broken downloads based on a single file
-	// defer os.RemoveAll(tempFolder) //delete tmp folder upon returning from this function
-	branch := Branch
-	JsonFileListURL := fmt.Sprintf(JsonTreeVariable, ModelDatasetName, branch, folderName)
-	jsonFilesList := []hfmodel{}
-	for _, file := range jsonFilesList {
-		filePath := path.Join(ModelPath, file.Path)
-		if file.IsDirectory {
-			// Directory handling remains unchanged
-			if err := os.MkdirAll(filePath, os.ModePerm); err != nil {
-				return err
-			}
-			//here we should pass the original name with filters, other wise the filter will be applied
+type uploadProgress struct {
+	totalBytes     int64
+	uploadedBytes  atomic.Int64
+	progressBar    *mpb.Bar
+	progress       *mpb.Progress
+}
 
-			if err := processHFFolderTree(ModelPath, IsDataset, SkipSHA, originalDataSetName, Branch, file.Path, silentMode); err != nil {
-				return err
-			}
-		} else {
-			// Use NeedsDownload flag to determine if the file should be downloaded
-			if file.NeedsDownload {
-				if file.IsLFS || needsDownload(filePath, file.Size) {
-					tempFolder := filepath.Join(ModelPath, "tmp")
-					downloadErr := downloadFileMultiThread(tempFolder, file.DownloadLink, filePath, silentMode)
-					if downloadErr != nil {
-						if !silentMode {
-							fmt.Printf("\n%s", errorColor("Error downloading file with multi-threading: ", downloadErr))
-						}
-						return downloadErr
-					}
-				} else {
-					// For smaller files or if not using multi-threading, a single-threaded download can be used
-					downloadErr := downloadSingleThreaded(file.DownloadLink, filePath)
-					if downloadErr != nil {
-						if !silentMode {
-							fmt.Printf("\n%s", errorColor("Error downloading file with single-threading: ", downloadErr))
-						}
-						return downloadErr
-					}
-				}
-			}
-		}
-	}
-	if !silentMode {
-		fmt.Printf("\n%s", infoColor("Getting File Download Files List Tree from: ", JsonFileListURL))
-	}
+func DownloadModel(ModelDatasetName string, AppendFilterToPath bool, SkipSHA bool, IsDataset bool, DestinationBasePath string, ModelBranch string, concurrentConnections int, token string, silentMode bool, r2cfg *R2Config, skipLocal bool) error {
+	// Construct model path
+	modelP := strings.Split(ModelDatasetName, ":")[0]
+	modelPath := filepath.Join(DestinationBasePath, modelP)
+	
+	// Limit concurrent operations to a reasonable number
+	maxWorkers := 4 // Limit to 4 concurrent downloads/uploads
+	
+	jobs := make(chan hfmodel, maxWorkers)
+	results := make(chan error, maxWorkers)
+	var wg sync.WaitGroup
+	var completedFiles atomic.Int32
 
-	client := &http.Client{}
-	req, err := http.NewRequest("GET", JsonFileListURL, nil)
-	if err != nil {
-		return err
-	}
-	if RequiresAuth {
-		// Set the authorization header with the Bearer token
-		bearerToken := AuthToken
-		req.Header.Add("Authorization", "Bearer "+bearerToken)
-	}
+	// Start limited number of workers
+	for i := 0; i < maxWorkers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for file := range jobs {
+				downloadURL := fmt.Sprintf("https://huggingface.co/datasets/%s/resolve/%s/%s",
+					ModelDatasetName,
+					ModelBranch,
+					file.Path,
+				)
 
-	resp, err := client.Do(req)
-	if err != nil {
-		if !silentMode {
-			fmt.Println(errorColor("Error:"), err)
-		}
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == 401 && !RequiresAuth {
-		return fmt.Errorf("\n%s", errorColor("Repo requires access token, generate an access token form huggingface, and pass it using flag: -t TOKEN"))
-	}
-	if resp.StatusCode == 403 {
-		return fmt.Errorf("\n%s", errorColor("You need to manually accept the agreement for this model/dataset: ", AgreementURL, " on HuggingFace site, No bypass will be implemented"))
-	}
-	// Read the response body into a byte slice
-	content, err := io.ReadAll(resp.Body)
-	if err != nil {
-		if !silentMode {
-			fmt.Println(errorColor("Error:"), err)
-		}
-		return err
+				fmt.Printf("Worker %d: Starting download of %s\n", workerID, file.Path)
 
-	}
-
-	err = json.Unmarshal(content, &jsonFilesList)
-	if err != nil {
-		return err
-	}
-	for i := range jsonFilesList {
-		jsonFilesList[i].AppendedPath = path.Join(ModelPath, jsonFilesList[i].Path)
-		if jsonFilesList[i].Type == "directory" {
-			jsonFilesList[i].IsDirectory = true
-			err := os.MkdirAll(path.Join(ModelPath, jsonFilesList[i].Path), os.ModePerm)
-			if err != nil {
-				return err
-			}
-			jsonFilesList[i].SkipDownloading = true
-			// now if this a folder, this whole function will be called again recursively
-			//here we should pass the original name with filters, other wise the filter will be applied
-
-			err = processHFFolderTree(ModelPath, IsDataset, SkipSHA, originalDataSetName, Branch, jsonFilesList[i].Path, silentMode) // recursive call
-			if err != nil {
-				return err
-			}
-			continue
-		}
-
-		jsonFilesList[i].DownloadLink = fmt.Sprintf(RawFileURL, ModelDatasetName, branch, jsonFilesList[i].Path)
-		if jsonFilesList[i].Lfs != nil {
-			jsonFilesList[i].IsLFS = true
-			resolverURL := fmt.Sprintf(LfsResolverURL, ModelDatasetName, branch, jsonFilesList[i].Path)
-			getLink, err := getRedirectLink(resolverURL)
-			if err != nil {
-				return err
-			}
-			// Check for filter
-			if HasFilter {
-				filenameLowerCase := strings.ToLower(jsonFilesList[i].Path)
-				if strings.HasSuffix(filenameLowerCase, ".act") || strings.HasSuffix(filenameLowerCase, ".bin") ||
-					strings.Contains(filenameLowerCase, ".gguf") || // either *.gguf or *.gguf-split-{a, b, ...}
-					strings.HasSuffix(filenameLowerCase, ".safetensors") || strings.HasSuffix(filenameLowerCase, ".pt") || strings.HasSuffix(filenameLowerCase, ".meta") ||
-					strings.HasSuffix(filenameLowerCase, ".zip") || strings.HasSuffix(filenameLowerCase, ".z01") || strings.HasSuffix(filenameLowerCase, ".onnx") || strings.HasSuffix(filenameLowerCase, ".data") ||
-					strings.HasSuffix(filenameLowerCase, ".onnx_data") ||
-					strings.HasSuffix(filenameLowerCase, ".llamafile") {
-					jsonFilesList[i].FilterSkip = true // we assume its skipped, unless below condition range match
-					for _, ff := range FilterBinFileString {
-						if strings.Contains(filenameLowerCase, ff) {
-							jsonFilesList[i].FilterSkip = false
-						}
-					}
-
-				}
-			}
-			jsonFilesList[i].DownloadLink = getLink
-		}
-	}
-	// UNCOMMENT BELOW TWO LINES TO DEBUG THIS FOLDER JSON STRUCTURE
-	// s, _ := json.MarshalIndent(jsonFilesList, "", "  ")
-	// fmt.Println(string(s))
-	// 2nd loop through the files, checking exists/non-exists
-	for i := range jsonFilesList {
-		// check if the file exists before
-		// Check if the file exists
-		if jsonFilesList[i].IsDirectory {
-			continue
-		}
-		if jsonFilesList[i].FilterSkip {
-			continue
-		}
-		filename := jsonFilesList[i].AppendedPath
-		if _, err := os.Stat(filename); err == nil {
-			// File exists, get its size
-			fileInfo, _ := os.Stat(filename)
-			size := fileInfo.Size()
-			if !silentMode {
-				fmt.Printf("\n%s", infoColor("Checking Existing file: ", jsonFilesList[i].AppendedPath))
-			}
-			//  for non-lfs files, I can only compare size, I don't there is a sha256 hash for them
-			if size == int64(jsonFilesList[i].Size) {
-				jsonFilesList[i].SkipDownloading = true
-				if jsonFilesList[i].IsLFS {
-					if !SkipSHA {
-						err := verifyChecksum(jsonFilesList[i].AppendedPath, jsonFilesList[i].Lfs.Oid_SHA265)
-						if err != nil {
-							err := os.Remove(jsonFilesList[i].AppendedPath)
-							if err != nil {
-								return err
-							}
-							jsonFilesList[i].SkipDownloading = false
-							if !silentMode {
-								fmt.Printf("\n%s", warningColor("Hash failed for LFS file: ", jsonFilesList[i].AppendedPath, ", will redownload/resume"))
-							}
-							return err
-						}
-						if !silentMode {
-							fmt.Printf("\n%s", successColor("Hash Matched for LFS file: ", jsonFilesList[i].AppendedPath))
-						}
-					} else {
-						if !silentMode {
-							fmt.Printf("\n%s", infoColor("Hash Matching SKIPPED for LFS file: ", jsonFilesList[i].AppendedPath))
-						}
-					}
-
-				} else {
-					if !silentMode {
-						fmt.Printf("\n%s", successColor("file size matched for non LFS file: ", jsonFilesList[i].AppendedPath))
-					}
-				}
-			}
-
-		}
-
-	}
-	// 3ed loop through the files, downloading missing/failed files
-	for i := range jsonFilesList {
-		if jsonFilesList[i].IsDirectory {
-			continue
-		}
-		if jsonFilesList[i].SkipDownloading {
-			if !silentMode {
-				fmt.Printf("\n%s", infoColor("Skipping: ", jsonFilesList[i].AppendedPath))
-			}
-			continue
-		}
-		if jsonFilesList[i].FilterSkip {
-			if !silentMode {
-				fmt.Printf("\n%s", infoColor("Filter Skipping: ", jsonFilesList[i].AppendedPath))
-			}
-			continue
-		}
-		// fmt.Printf("Downloading: %s\n", jsonFilesList[i].Path)
-		if jsonFilesList[i].IsLFS {
-			err := downloadFileMultiThread(tempFolder, jsonFilesList[i].DownloadLink, jsonFilesList[i].AppendedPath, silentMode)
-			if err != nil {
-				return err
-			}
-			// lfs file, verify by checksum
-			if !silentMode {
-				fmt.Printf("\n%s", infoColor("Checking SHA256 Hash for LFS file: ", jsonFilesList[i].AppendedPath))
-			}
-			if !SkipSHA {
-				err = verifyChecksum(jsonFilesList[i].AppendedPath, jsonFilesList[i].Lfs.Oid_SHA265)
+				// Create request
+				req, err := http.NewRequest("GET", downloadURL, nil)
 				if err != nil {
-					err := os.Remove(jsonFilesList[i].AppendedPath)
-					if err != nil {
-						return err
-					}
-					// jsonFilesList[i].SkipDownloading = false
-					if !silentMode {
-						fmt.Printf("\n%s", errorColor("Hash failed for LFS file: ", jsonFilesList[i].AppendedPath, "will redownload/resume"))
-					}
-					return err
-				}
-				if !silentMode {
-					fmt.Printf("\n%s", successColor("Hash Matched for LFS file: ", jsonFilesList[i].AppendedPath))
+					results <- fmt.Errorf("failed to create request for %s: %v", file.Path, err)
+					continue
 				}
 
-			} else {
-				if !silentMode {
-					fmt.Printf("\n%s", warningColor("Hash Matching SKIPPED for LFS file: ", jsonFilesList[i].AppendedPath))
+				if RequiresAuth {
+					req.Header.Add("Authorization", "Bearer "+AuthToken)
 				}
-			}
+				req.Header.Add("User-Agent", "Mozilla/5.0")
 
-		} else {
-			// err := downloadFileMultiThread(tempFolder, jsonFilesList[i].DownloadLink, jsonFilesList[i].AppendedPath) //maybe later I'll enable multithreading for all files, even non-lfs
-			err = downloadSingleThreaded(jsonFilesList[i].DownloadLink, jsonFilesList[i].AppendedPath) // no checksum available for small non-lfs files
-			if err != nil {
-				return err
-			}
-			// non-lfs file, verify by size matching
-			if !silentMode {
-				fmt.Printf("\nChecking file size matching: %s", jsonFilesList[i].AppendedPath)
-			}
-			if _, err := os.Stat(jsonFilesList[i].AppendedPath); err == nil {
-				fileInfo, _ := os.Stat(jsonFilesList[i].AppendedPath)
-				size := fileInfo.Size()
-				if size != int64(jsonFilesList[i].Size) {
-					return fmt.Errorf("\n%s", errorColor("File size mismatch: ", jsonFilesList[i].AppendedPath, ", filesize: ", size, "Needed Size: ", jsonFilesList[i].Size))
+				// Download file
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					results <- fmt.Errorf("failed to download %s: %v", file.Path, err)
+					continue
 				}
-			} else {
-				return fmt.Errorf("\n%s", errorColor("File does not exist: ", jsonFilesList[i].AppendedPath))
+
+				if resp.StatusCode != http.StatusOK {
+					resp.Body.Close()
+					results <- fmt.Errorf("failed to download %s: status %d", file.Path, resp.StatusCode)
+					continue
+				}
+
+				// Create R2 key
+				r2Key := fmt.Sprintf("HuggingFaceFW_fineweb-edu-score-2/%s", strings.TrimPrefix(file.Path, "data/"))
+				
+				// Create progress bar
+				progress := createProgressBar(int64(file.Size), filepath.Base(file.Path))
+				
+				// Upload to R2
+				ctx := context.Background()
+				var uploadErr error
+				if int64(file.Size) > multipartThreshold {
+					uploadErr = streamMultipartToR2(ctx, *r2cfg, resp.Body, r2Key, int64(file.Size), progress)
+				} else {
+					uploadErr = streamSimpleToR2(ctx, *r2cfg, resp.Body, r2Key, int64(file.Size), progress)
+				}
+				resp.Body.Close()
+
+				if uploadErr != nil {
+					results <- fmt.Errorf("failed to upload %s: %v", file.Path, uploadErr)
+					continue
+				}
+
+				completedFiles.Add(1)
+				fmt.Printf("✅ Worker %d: Completed %s\n", workerID, r2Key)
+			}
+		}(i)
+	}
+
+	// Process files function
+	processFiles := func(files []hfmodel) {
+		for _, file := range files {
+			if !file.IsDirectory && !file.FilterSkip && file.Size > 0 {
+				// Add delay between queueing files
+				time.Sleep(time.Second)
+				fmt.Printf("Queueing: %s (%s)\n", file.Path, formatSize(int64(file.Size)))
+				jobs <- file
 			}
 		}
 	}
-	os.RemoveAll(tempFolder) // by here its safe to delete the temp folder
+
+	// Process the file tree
+	err := processHFFolderTree(modelPath, IsDataset, SkipSHA, ModelDatasetName, ModelBranch, "", silentMode, r2cfg, skipLocal, processFiles)
+	if err != nil {
+		return fmt.Errorf("error processing file tree: %v", err)
+	}
+
+	// Close jobs and wait
+	close(jobs)
+	wg.Wait()
+	close(results)
+
+	// Check for errors
+	var errors []error
+	for err := range results {
+		errors = append(errors, err)
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("encountered errors: %v", errors)
+	}
+
 	return nil
 }
 
-func fetchFileList(JsonFileListURL string) ([]hfmodel, error) {
-	var filesList []hfmodel
-
-	client := &http.Client{}
-	req, err := http.NewRequest("GET", JsonFileListURL, nil)
-	if err != nil {
-		return nil, err
+func processHFFolderTree(modelPath string, IsDataset bool, SkipSHA bool, ModelDatasetName string, ModelBranch string, folderName string, silentMode bool, r2cfg *R2Config, skipLocal bool, processFiles func([]hfmodel)) error {
+	if !silentMode {
+		fmt.Printf("🔍 Scanning: %s\n", folderName)
 	}
+
+	// Build the correct API URL
+	var url string
+	if IsDataset {
+		if folderName == "" {
+			url = fmt.Sprintf(JsonDatasetFileTreeURL, ModelDatasetName, ModelBranch, "data")
+		} else {
+			url = fmt.Sprintf(JsonDatasetFileTreeURL, ModelDatasetName, ModelBranch, folderName)
+		}
+	}
+
+	if !silentMode {
+		fmt.Printf("📡 API URL: %s\n", url)
+	}
+
+	// Make request and get files
+	files, err := fetchFileList(url)
+	if err != nil {
+		return err
+	}
+
+	if !silentMode {
+		fmt.Printf("📂 Found %d items in %s\n", len(files), folderName)
+	}
+
+	// For each CC-MAIN directory, fetch its contents
+	for _, file := range files {
+		// Check if it's a CC-MAIN directory (they're reported as files but are actually directories)
+		if strings.Contains(file.Path, "CC-MAIN-") {
+			dirPath := file.Path
+			if !silentMode {
+				fmt.Printf("📁 Entering directory: %s\n", dirPath)
+			}
+
+			// Fetch contents of this CC-MAIN directory
+			dirUrl := fmt.Sprintf(JsonDatasetFileTreeURL, ModelDatasetName, ModelBranch, dirPath)
+			dirFiles, err := fetchFileList(dirUrl)
+			if err != nil {
+				fmt.Printf("⚠️ Error fetching directory %s: %v\n", dirPath, err)
+				continue
+			}
+
+			// Process the parquet files in this directory
+			var parquetFiles []hfmodel
+			for _, df := range dirFiles {
+				if strings.HasSuffix(df.Path, ".parquet") && df.Size > 0 {
+					if df.IsLFS {
+						df.DownloadLink = fmt.Sprintf(LfsDatasetResolverURL, ModelDatasetName, ModelBranch, df.Path)
+					} else {
+						df.DownloadLink = fmt.Sprintf(RawDatasetFileURL, ModelDatasetName, ModelBranch, df.Path)
+					}
+					parquetFiles = append(parquetFiles, df)
+				}
+			}
+
+			if len(parquetFiles) > 0 {
+				if !silentMode {
+					fmt.Printf("📦 Processing %d parquet files from %s\n", len(parquetFiles), dirPath)
+				}
+				processFiles(parquetFiles)
+			}
+		}
+	}
+
+	return nil
+}
+
+// Helper function to fetch and parse file list
+func fetchFileList(url string) ([]hfmodel, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %v", err)
+	}
+
 	if RequiresAuth {
 		req.Header.Add("Authorization", "Bearer "+AuthToken)
 	}
+	req.Header.Add("User-Agent", "Mozilla/5.0")
 
-	resp, err := client.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to fetch file list: %v", err)
 	}
 	defer resp.Body.Close()
 
-	if err := json.NewDecoder(resp.Body).Decode(&filesList); err != nil {
-		return nil, err
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("failed to fetch file list, status: %d, body: %s", resp.StatusCode, string(body))
 	}
 
-	return filesList, nil
+	var files []hfmodel
+	if err := json.NewDecoder(resp.Body).Decode(&files); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %v", err)
+	}
+
+	return files, nil
+}
+
+// Add a helper function to format file sizes
+func formatSize(size int64) string {
+	const unit = 1024
+	if size < unit {
+		return fmt.Sprintf("%d B", size)
+	}
+	div, exp := int64(unit), 0
+	for n := size / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(size)/float64(div), "KMGTPE"[exp])
 }
 
 func needsDownload(filePath string, remoteSize int) bool {
@@ -652,150 +531,272 @@ func mergeFiles(tempFolder, outputFileName string, numChunks int) error {
 	return nil
 }
 
-func downloadFileMultiThread(tempFolder, url, outputFileName string, silentMode bool) error {
-	client := &http.Client{}
-	req, err := http.NewRequest("HEAD", url, nil)
+func downloadFileMultiThread(tempFolder, url, outputFileName string, silentMode bool, r2cfg *R2Config, skipLocal bool) error {
+	// Use larger buffer for network operations
+	client := &http.Client{
+		Transport: &http.Transport{
+			MaxIdleConns:        128,
+			MaxIdleConnsPerHost: 128,
+			IdleConnTimeout:     90 * time.Second,
+			DisableCompression:  true, // Often faster for high-bandwidth connections
+			MaxConnsPerHost:     128,
+			WriteBufferSize:     64 * 1024, // 64KB
+			ReadBufferSize:      64 * 1024, // 64KB
+		},
+	}
+	
+	req, err := client.Head(url)
 	if err != nil {
 		return err
 	}
-	if RequiresAuth {
-		// Set the authorization header with the Bearer token
-		bearerToken := AuthToken
-		req.Header.Add("Authorization", "Bearer "+bearerToken)
-	}
-	resp, err := client.Do(req)
+	contentLength, err := strconv.Atoi(req.Header.Get("Content-Length"))
 	if err != nil {
 		return err
 	}
-	if resp.StatusCode == 401 && !RequiresAuth {
-		return fmt.Errorf("\n%s", errorColor("This Repo requires access token, generate an access token form huggingface, and pass it using flag: -t TOKEN"))
 
-	}
-	contentLength, err := strconv.Atoi(resp.Header.Get("Content-Length"))
-	if err != nil {
-		return err
+	// Create a pipe for streaming
+	pr, pw := io.Pipe()
+	var uploadErr error
+	var wg sync.WaitGroup
+
+	// Start R2 upload in a goroutine
+	if r2cfg != nil && skipLocal {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer pw.Close()
+			
+			ctx := context.Background()
+			r2Key := strings.TrimPrefix(outputFileName, "/")
+			uploadErr = streamMultipartToR2(ctx, *r2cfg, pr, r2Key, int64(contentLength), nil)
+		}()
 	}
 
+	// Download and write to pipe
 	chunkSize := int64(contentLength / NumConnections)
-
-	progress := make(chan int64, NumConnections)
-
-	// update 1.2.5; we need to check now, if the tmp folder does exists, if the number of files exists before, matched the number of connection, we can proceed with the logic of resuming
-	// Calculate the temp file name pattern.
-	baseFileName := path.Base(outputFileName)
-	tmpFileNamePattern := filepath.Join(tempFolder, fmt.Sprintf("%s_*.tmp", baseFileName))
-
-	// Use Glob to find all files that match this pattern.
-	matches, err := filepath.Glob(tmpFileNamePattern)
-	if err != nil {
-		if !silentMode {
-			fmt.Println(err)
-		}
-		return err
-	}
-
-	// Print the number of matched files.
-	// count := len(matches)
-	if len(matches) > 0 {
-		if !silentMode {
-			fmt.Printf("\n%s", infoColor("Found existing incomplete download for the file: ", baseFileName, "\nForcing Number of connections to: ", len(matches), "\n\n"))
-		}
-		NumConnections = len(matches)
-	}
-	wg := &sync.WaitGroup{}
-
-	errChan := make(chan error)
+	var downloadWg sync.WaitGroup
+	errChan := make(chan error, NumConnections)
 
 	for i := 0; i < NumConnections; i++ {
 		start := int64(i) * chunkSize
 		end := start + chunkSize
-
 		if i == NumConnections-1 {
 			end = int64(contentLength)
 		}
-		wg.Add(1)
-		go func(i int, start, end int64) {
-			err := downloadChunk(tempFolder, path.Base(outputFileName), i, url, start, end, progress)
-			if err != nil {
-				errChan <- fmt.Errorf("\n%s", errorColor("error downloading chunk ", i, ":", err))
-			}
 
-			wg.Done() // prevent panic send on closed channel
+		downloadWg.Add(1)
+		go func(i int, start, end int64) {
+			defer downloadWg.Done()
+			
+			err := downloadChunkToWriter(url, start, end, pw)
+			if err != nil {
+				errChan <- fmt.Errorf("chunk %d download failed: %v", i, err)
+			}
 		}(i, start, end)
 	}
-	// Mark the start time of the download
-	if !silentMode { // TODO: check if we change later to always printing regardless of silent or non silent mode
-		fmt.Printf("\nStart Downloading: %s", outputFileName)
-	}
-	startTime := time.Now()
-	go func() {
-		var totalDownloaded int64
-		lastPrintTime := startTime.Add(-time.Second)
 
-		rateCheckpoints := make([]struct {
-			time  time.Time
-			bytes int64
-		}, 10)
-		for i := range rateCheckpoints {
-			rateCheckpoints[i].time = startTime
-		}
+	// Wait for downloads to complete
+	downloadWg.Wait()
+	close(errChan)
 
-		fmt.Printf("\n\n")
-		for chunkSize := range progress {
-			now := time.Now()
-			totalDownloaded += chunkSize
-
-			if now.Sub(rateCheckpoints[len(rateCheckpoints)-2].time) >= 1*time.Second {
-				for i := 1; i < len(rateCheckpoints); i++ {
-					rateCheckpoints[i-1] = rateCheckpoints[i]
-				}
-			}
-			rateCheckpoints[len(rateCheckpoints)-1] = struct {
-				time  time.Time
-				bytes int64
-			}{now, totalDownloaded}
-
-			// Calculate speed in megabytes per second
-			elapsed := now.Sub(rateCheckpoints[0].time).Seconds()
-			speed := float64(rateCheckpoints[len(rateCheckpoints)-1].bytes-rateCheckpoints[0].bytes) / (1024 * 1024) / elapsed
-			if !silentMode {
-				if time.Since(lastPrintTime).Seconds() >= 0.1 || totalDownloaded == int64(contentLength) {
-					fmt.Printf("\rDownloading %s Speed: %.2f MB/sec, %.2f%% ", outputFileName, speed, float64(totalDownloaded*100)/float64(contentLength))
-					lastPrintTime = time.Now()
-				}
-			}
-		}
-	}()
-
-	go func() {
-		wg.Wait() // Wait for all downloadChunk to finish
-		close(errChan)
-	}()
-
-	// Check if there was an error in any of the running routines
+	// Check for download errors
 	for err := range errChan {
 		if err != nil {
-			if !silentMode {
-				fmt.Println(err) // Or however you want to handle the error
-			}
-			// Here you can choose to return, exit, or however you want to stop going forward
 			return err
 		}
 	}
 
-	// fmt.Print("\nDownload completed")
-	if !silentMode {
-		fmt.Printf("\nMerging %s Chunks", outputFileName)
+	// Wait for upload to complete
+	wg.Wait()
+	
+	if uploadErr != nil {
+		return fmt.Errorf("R2 upload failed: %v", uploadErr)
 	}
-	err = mergeFiles(tempFolder, outputFileName, NumConnections)
+
+	return nil
+}
+
+// Optimize multipart upload
+func streamMultipartToR2(ctx context.Context, r2cfg R2Config, reader io.Reader, key string, contentLength int64, progress *uploadProgress) error {
+	client := createR2Client(ctx, r2cfg)
+	
+	// Initialize multipart upload
+	resp, err := client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+		Bucket: aws.String(r2cfg.BucketName),
+		Key:    aws.String(key),
+	})
 	if err != nil {
 		return err
 	}
-	if !silentMode { // TODO: check if we change later to always printing regardless of silent or non silent mode
-		fmt.Printf("\nFinished Downloading: %s", outputFileName)
+	uploadID := *resp.UploadId
+
+	// Calculate number of parts
+	numParts := (contentLength + chunkSize - 1) / chunkSize
+	parts := make([]types.CompletedPart, 0, numParts)
+	completedParts := make(chan types.CompletedPart, numParts)
+	errChan := make(chan error, numParts)
+	
+	// Use buffered channel as semaphore
+	sem := make(chan struct{}, maxConcurrent)
+	var wg sync.WaitGroup
+
+	// Create memory pool for part buffers
+	bufferPool := sync.Pool{
+		New: func() interface{} {
+			return make([]byte, chunkSize)
+		},
 	}
-	return nil
+
+	// Upload parts concurrently
+	for partNum := int64(1); partNum <= numParts; partNum++ {
+		wg.Add(1)
+		go func(partNum int64) {
+			defer wg.Done()
+			sem <- struct{}{} // Acquire semaphore
+			defer func() { <-sem }() // Release semaphore
+
+			buffer := bufferPool.Get().([]byte)
+			defer bufferPool.Put(buffer)
+
+			start := (partNum - 1) * chunkSize
+			size := min(chunkSize, contentLength-start)
+			
+			// Read part data
+			if _, err := io.ReadFull(reader, buffer[:size]); err != nil {
+				errChan <- fmt.Errorf("failed to read part %d: %v", partNum, err)
+				return
+			}
+
+			// Upload part with retries
+			for retry := 0; retry < maxRetries; retry++ {
+				part, err := uploadPart(ctx, client, r2cfg.BucketName, key, uploadID, partNum, buffer[:size])
+				if err == nil {
+					completedParts <- part
+					if progress != nil {
+						progress.uploadedBytes.Add(size)
+						progress.progressBar.SetCurrent(progress.uploadedBytes.Load())
+					}
+					return
+				}
+				
+				if retry < maxRetries-1 {
+					time.Sleep(retryDelay)
+				}
+			}
+			errChan <- fmt.Errorf("failed to upload part %d after %d retries", partNum, maxRetries)
+		}(partNum)
+	}
+
+	// Wait for completion
+	go func() {
+		wg.Wait()
+		close(completedParts)
+		close(errChan)
+	}()
+
+	// Collect results
+	for part := range completedParts {
+		parts = append(parts, part)
+	}
+
+	// Check for errors
+	var uploadErrors []error
+	for err := range errChan {
+		if err != nil {
+			uploadErrors = append(uploadErrors, err)
+		}
+	}
+
+	if len(uploadErrors) > 0 {
+		// Abort upload on errors
+		_, _ = client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+			Bucket:   aws.String(r2cfg.BucketName),
+			Key:      aws.String(key),
+			UploadId: aws.String(uploadID),
+		})
+		return fmt.Errorf("upload errors: %v", uploadErrors)
+	}
+
+	// Complete multipart upload
+	sort.Slice(parts, func(i, j int) bool {
+		return *parts[i].PartNumber < *parts[j].PartNumber
+	})
+
+	_, err = client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket:          aws.String(r2cfg.BucketName),
+		Key:             aws.String(key),
+		UploadId:        aws.String(uploadID),
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: parts},
+	})
+
+	return err
 }
+
+// Helper function for uploading individual parts
+func uploadPart(ctx context.Context, client *s3.Client, bucket, key, uploadID string, partNum int64, data []byte) (types.CompletedPart, error) {
+	contentLength := int64(len(data))
+	input := &s3.UploadPartInput{
+		Bucket:        aws.String(bucket),
+		Key:           aws.String(key),
+		PartNumber:    aws.Int32(int32(partNum)),
+		UploadId:      aws.String(uploadID),
+		Body:          bytes.NewReader(data),
+		ContentLength: &contentLength,
+	}
+	
+	result, err := client.UploadPart(ctx, input)
+	if err != nil {
+		return types.CompletedPart{}, err
+	}
+	
+	return types.CompletedPart{
+		ETag:       result.ETag,
+		PartNumber: aws.Int32(int32(partNum)),
+	}, nil
+}
+
+// Optimize S3 client configuration
+func createR2Client(ctx context.Context, r2cfg R2Config) *s3.Client {
+	r2Resolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
+		return aws.Endpoint{
+			URL: fmt.Sprintf("https://%s.r2.cloudflarestorage.com", r2cfg.AccountID),
+		}, nil
+	})
+
+	cfg, err := config.LoadDefaultConfig(ctx,
+		config.WithEndpointResolverWithOptions(r2Resolver),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
+			r2cfg.AccessKeyID,
+			r2cfg.AccessKeySecret,
+			"",
+		)),
+		config.WithRegion(r2cfg.Region),
+		// Add performance configurations
+		config.WithHTTPClient(&http.Client{
+			Transport: &http.Transport{
+				MaxIdleConns:        256,
+				MaxIdleConnsPerHost: 256,
+				IdleConnTimeout:     30 * time.Second,
+				DisableCompression:  true,
+				MaxConnsPerHost:     256,
+				WriteBufferSize:     64 * 1024,
+				ReadBufferSize:      64 * 1024,
+				DialContext: (&net.Dialer{
+					Timeout:   10 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
+			},
+			Timeout: 30 * time.Minute,
+		}),
+	)
+
+	if err != nil {
+		panic(err)
+	}
+
+	return s3.NewFromConfig(cfg)
+}
+
 func downloadSingleThreaded(url, outputFileName string) error {
 	outputFile, err := os.Create(outputFileName)
 
@@ -833,4 +834,166 @@ func downloadSingleThreaded(url, outputFileName string) error {
 
 	// fmt.Println("\nDownload completed")
 	return nil
+}
+
+func uploadToR2(ctx context.Context, r2cfg R2Config, localPath string, r2Key string) error {
+	r2Resolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
+		return aws.Endpoint{
+			URL: fmt.Sprintf("https://%s.r2.cloudflarestorage.com", r2cfg.AccountID),
+		}, nil
+	})
+
+	cfg, err := config.LoadDefaultConfig(ctx,
+		config.WithEndpointResolverWithOptions(r2Resolver),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
+			r2cfg.AccessKeyID,
+			r2cfg.AccessKeySecret,
+			"",
+		)),
+		config.WithRegion(r2cfg.Region),
+	)
+	if err != nil {
+		return fmt.Errorf("unable to load SDK config: %v", err)
+	}
+
+	client := s3.NewFromConfig(cfg)
+
+	file, err := os.Open(localPath)
+	if err != nil {
+		return fmt.Errorf("unable to open file: %v", err)
+	}
+	defer file.Close()
+
+	_, err = client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(r2cfg.BucketName),
+		Key:    aws.String(r2Key),
+		Body:   file,
+	})
+	
+	return err
+}
+
+func streamSmallFileToR2(url, outputFileName string, r2cfg R2Config) error {
+	// Implement the logic to stream a small file directly to R2
+	// This is a placeholder and should be replaced with the actual implementation
+	return fmt.Errorf("streaming small file to R2 is not implemented")
+}
+
+// Add new function for streaming chunks
+func downloadChunkToWriter(url string, start, end int64, writer io.Writer) error {
+	client := &http.Client{}
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return err
+	}
+	
+	if RequiresAuth {
+		req.Header.Add("Authorization", "Bearer "+AuthToken)
+	}
+	
+	rangeHeader := fmt.Sprintf("bytes=%d-%d", start, end-1)
+	req.Header.Add("Range", rangeHeader)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	buffer := make([]byte, 32*1024)
+	_, err = io.CopyBuffer(writer, resp.Body, buffer)
+	return err
+}
+
+// Add new function for streaming to R2
+func streamToR2(ctx context.Context, r2cfg R2Config, reader io.Reader, key string, contentLength int) error {
+	client := createR2Client(ctx, r2cfg)
+	length := int64(contentLength)
+	_, err := client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:        aws.String(r2cfg.BucketName),
+		Key:           aws.String(key),
+		Body:          reader,
+		ContentLength: &length,
+	})
+
+	return err
+}
+
+// Progress reader implementation
+type progressReader struct {
+	reader   io.Reader
+	progress *uploadProgress
+	buffer   *bufio.Reader
+}
+
+func newProgressReader(reader io.Reader, progress *uploadProgress) *progressReader {
+	return &progressReader{
+		reader:   reader,
+		progress: progress,
+		buffer:   bufio.NewReaderSize(reader, bufferSize),
+	}
+}
+
+func (r *progressReader) Read(p []byte) (int, error) {
+	n, err := r.buffer.Read(p)
+	if n > 0 && r.progress != nil {
+		r.progress.uploadedBytes.Add(int64(n))
+		r.progress.progressBar.SetCurrent(r.progress.uploadedBytes.Load())
+	}
+	return n, err
+}
+
+// Helper function for simple uploads
+func streamSimpleToR2(ctx context.Context, r2cfg R2Config, reader io.Reader, key string, contentLength int64, progress *uploadProgress) error {
+	if progress == nil {
+		progress = createProgressBar(contentLength, filepath.Base(key))
+	}
+	defer progress.progress.Wait()
+
+	client := createR2Client(ctx, r2cfg)
+	progressReader := newProgressReader(reader, progress)
+	
+	length := contentLength
+	_, err := client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:        aws.String(r2cfg.BucketName),
+		Key:           aws.String(key),  // This will now use the properly prefixed key
+		Body:          progressReader,
+		ContentLength: &length,
+	})
+	
+	return err
+}
+
+func min(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// Add function to create progress bar
+func createProgressBar(total int64, filename string) *uploadProgress {
+	p := mpb.New(
+		mpb.WithWidth(60),
+		mpb.WithRefreshRate(180*time.Millisecond),
+	)
+
+	bar := p.New(total,
+		mpb.BarStyle().Lbound("[").Filler("=").Tip(">").Padding("-").Rbound("]"),
+		mpb.PrependDecorators(
+			decor.Name(fmt.Sprintf("Uploading %s ", filename), decor.WCSyncWidth),
+			decor.CountersKibiByte("%.2f / %.2f"),
+		),
+		mpb.AppendDecorators(
+			decor.Percentage(),
+			decor.AverageSpeed(decor.SizeB1024(0), " %.1f"),
+			decor.Elapsed(decor.ET_STYLE_GO),
+		),
+	)
+
+	return &uploadProgress{
+		totalBytes:  total,
+		progressBar: bar,
+		progress:    p,
+	}
 }
