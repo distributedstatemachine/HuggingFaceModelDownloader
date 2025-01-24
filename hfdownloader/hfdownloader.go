@@ -29,9 +29,8 @@ import (
 	"bytes"
 	// "crypto/md5"
 	// "encoding/base64"
-	"github.com/vbauerster/mpb/v8"
-	"github.com/vbauerster/mpb/v8/decor"
-	"bufio"
+	"github.com/schollz/progressbar/v3"
+	// "bufio"
 	"net"
 )
 
@@ -44,12 +43,13 @@ const (
 	LfsDatasetResolverURL  = "https://huggingface.co/datasets/%s/resolve/%s/%s"
 	JsonModelsFileTreeURL  = "https://huggingface.co/api/models/%s/tree/%s/%s"
 	JsonDatasetFileTreeURL = "https://huggingface.co/api/datasets/%s/tree/%s/%s"
-	// Optimize for high-bandwidth uploads
-	streamBufferSize    = 128 * 1024 * 1024   // 128MB buffer
-	multipartThreshold  = 512 * 1024 * 1024   // 512MB threshold
-	chunkSize          = 128 * 1024 * 1024   // 128MB per chunk for faster uploads
-	maxConcurrent      = 256                  // More concurrent operations
-	bufferSize         = 64 * 1024 * 1024    // 64MB buffer size
+	// Optimize for high-speed downloads
+	streamBufferSize    = 256 * 1024 * 1024  // 256MB buffer
+	multipartThreshold  = 1024 * 1024 * 1024 // 1GB threshold
+	chunkSize          = 256 * 1024 * 1024  // 256MB chunks
+	maxConcurrent      = 8                   // 8 concurrent files
+	maxPartsPerFile    = 16                  // 16 concurrent chunks per file
+	bufferSize         = 128 * 1024 * 1024  // 128MB buffer
 	maxRetries         = 3                    // Reduced retries for faster failure recovery
 	retryDelay         = 500 * time.Millisecond // Shorter retry delay
 )
@@ -96,31 +96,90 @@ type R2Config struct {
 }
 
 type uploadProgress struct {
-	totalBytes     int64
-	uploadedBytes  atomic.Int64
-	progressBar    *mpb.Bar
-	progress       *mpb.Progress
+	progress *progressbar.ProgressBar
+	mu       sync.Mutex
+}
+
+type progressReader struct {
+	reader   io.Reader
+	progress *uploadProgress
+}
+
+func (r *progressReader) Read(p []byte) (n int, err error) {
+	n, err = r.reader.Read(p)
+	if r.progress != nil {
+		r.progress.Add(int64(n))
+	}
+	return
+}
+
+func newProgressReader(reader io.Reader, progress *uploadProgress) io.Reader {
+	return &progressReader{
+		reader:   reader,
+		progress: progress,
+	}
+}
+
+func createProgressBar(total int64, filename string) *uploadProgress {
+	bar := progressbar.NewOptions64(
+		total,
+		progressbar.OptionSetDescription(filename),
+		progressbar.OptionShowBytes(true),
+		progressbar.OptionSetWidth(30),
+		progressbar.OptionThrottle(65*time.Millisecond),
+		progressbar.OptionShowCount(),
+		progressbar.OptionOnCompletion(func() {
+			fmt.Printf("\n")
+		}),
+	)
+	
+	return &uploadProgress{
+		progress: bar,
+	}
+}
+
+func (p *uploadProgress) Add(n int64) {
+	if p == nil || p.progress == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_ = p.progress.Add64(n)
 }
 
 func DownloadModel(ModelDatasetName string, AppendFilterToPath bool, SkipSHA bool, IsDataset bool, DestinationBasePath string, ModelBranch string, concurrentConnections int, token string, silentMode bool, r2cfg *R2Config, skipLocal bool) error {
-	// Construct model path
 	modelP := strings.Split(ModelDatasetName, ":")[0]
 	modelPath := filepath.Join(DestinationBasePath, modelP)
 	
-	// Limit concurrent operations to a reasonable number
-	maxWorkers := 4 // Limit to 4 concurrent downloads/uploads
-	
+	// Create R2 client for checking existing files
+	ctx := context.Background()
+	r2Client := createR2Client(ctx, *r2cfg)
+
+	maxWorkers := 8
 	jobs := make(chan hfmodel, maxWorkers)
 	results := make(chan error, maxWorkers)
 	var wg sync.WaitGroup
 	var completedFiles atomic.Int32
 
-	// Start limited number of workers
 	for i := 0; i < maxWorkers; i++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
 			for file := range jobs {
+				// Check if file already exists in R2
+				r2Key := fmt.Sprintf("HuggingFaceFW_fineweb-edu-score-2/%s", strings.TrimPrefix(file.Path, "data/"))
+				
+				_, err := r2Client.HeadObject(ctx, &s3.HeadObjectInput{
+					Bucket: aws.String(r2cfg.BucketName),
+					Key:    aws.String(r2Key),
+				})
+
+				if err == nil {
+					fmt.Printf("Skipping %s - already exists in R2\n", r2Key)
+					completedFiles.Add(1)
+					continue
+				}
+
 				downloadURL := fmt.Sprintf("https://huggingface.co/datasets/%s/resolve/%s/%s",
 					ModelDatasetName,
 					ModelBranch,
@@ -154,14 +213,10 @@ func DownloadModel(ModelDatasetName string, AppendFilterToPath bool, SkipSHA boo
 					continue
 				}
 
-				// Create R2 key
-				r2Key := fmt.Sprintf("HuggingFaceFW_fineweb-edu-score-2/%s", strings.TrimPrefix(file.Path, "data/"))
-				
 				// Create progress bar
 				progress := createProgressBar(int64(file.Size), filepath.Base(file.Path))
 				
 				// Upload to R2
-				ctx := context.Background()
 				var uploadErr error
 				if int64(file.Size) > multipartThreshold {
 					uploadErr = streamMultipartToR2(ctx, *r2cfg, resp.Body, r2Key, int64(file.Size), progress)
@@ -616,112 +671,150 @@ func downloadFileMultiThread(tempFolder, url, outputFileName string, silentMode 
 	return nil
 }
 
-// Optimize multipart upload
+// Add parallel chunk downloading
 func streamMultipartToR2(ctx context.Context, r2cfg R2Config, reader io.Reader, key string, contentLength int64, progress *uploadProgress) error {
 	client := createR2Client(ctx, r2cfg)
-	
-	// Initialize multipart upload
+
+	// First, check for and clean up any existing incomplete multipart uploads
+	listResp, err := client.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{
+		Bucket: aws.String(r2cfg.BucketName),
+		Prefix: aws.String(key),
+	})
+	if err == nil && listResp.Uploads != nil {
+		for _, upload := range listResp.Uploads {
+			_, err := client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+				Bucket:   aws.String(r2cfg.BucketName),
+				Key:      upload.Key,
+				UploadId: upload.UploadId,
+			})
+			if err != nil {
+				fmt.Printf("Warning: Failed to abort incomplete upload for %s: %v\n", *upload.Key, err)
+			}
+		}
+	}
+
+	// Create new multipart upload
 	resp, err := client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 		Bucket: aws.String(r2cfg.BucketName),
 		Key:    aws.String(key),
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create multipart upload: %v", err)
 	}
 	uploadID := *resp.UploadId
 
-	// Calculate number of parts
-	numParts := (contentLength + chunkSize - 1) / chunkSize
-	parts := make([]types.CompletedPart, 0, numParts)
-	completedParts := make(chan types.CompletedPart, numParts)
-	errChan := make(chan error, numParts)
-	
-	// Use buffered channel as semaphore
-	sem := make(chan struct{}, maxConcurrent)
-	var wg sync.WaitGroup
-
-	// Create memory pool for part buffers
-	bufferPool := sync.Pool{
-		New: func() interface{} {
-			return make([]byte, chunkSize)
-		},
+	// Calculate optimal part size (minimum 5MB, maximum 5GB)
+	partSize := contentLength / int64(maxPartsPerFile)
+	if partSize < 5*1024*1024 {
+		partSize = 5 * 1024 * 1024 // 5MB minimum
+	}
+	if partSize > 5*1024*1024*1024 {
+		partSize = 5 * 1024 * 1024 * 1024 // 5GB maximum
 	}
 
-	// Upload parts concurrently
-	for partNum := int64(1); partNum <= numParts; partNum++ {
+	// Create parts channel and results
+	type partResult struct {
+		Part types.CompletedPart
+		Err  error
+	}
+	parts := make([]types.CompletedPart, 0)
+	results := make(chan partResult, maxPartsPerFile)
+	var wg sync.WaitGroup
+
+	// Read and upload parts
+	var partNum int32 = 1
+	remainingBytes := contentLength
+
+	for remainingBytes > 0 {
+		size := partSize
+		if remainingBytes < partSize {
+			size = remainingBytes
+		}
+
+		buffer := make([]byte, size)
+		n, err := io.ReadFull(reader, buffer)
+		if err != nil && err != io.ErrUnexpectedEOF {
+			// Abort upload on error
+			_, abortErr := client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+				Bucket:   aws.String(r2cfg.BucketName),
+				Key:      aws.String(key),
+				UploadId: aws.String(uploadID),
+			})
+			if abortErr != nil {
+				fmt.Printf("Warning: Failed to abort upload after error: %v\n", abortErr)
+			}
+			return fmt.Errorf("failed to read part %d: %v", partNum, err)
+		}
+
 		wg.Add(1)
-		go func(partNum int64) {
+		go func(num int32, buf []byte) {
 			defer wg.Done()
-			sem <- struct{}{} // Acquire semaphore
-			defer func() { <-sem }() // Release semaphore
 
-			buffer := bufferPool.Get().([]byte)
-			defer bufferPool.Put(buffer)
+			// Upload part
+			partResp, err := client.UploadPart(ctx, &s3.UploadPartInput{
+				Bucket:     aws.String(r2cfg.BucketName),
+				Key:        aws.String(key),
+				PartNumber: aws.Int32(num),
+				UploadId:   aws.String(uploadID),
+				Body:       bytes.NewReader(buf),
+			})
 
-			start := (partNum - 1) * chunkSize
-			size := min(chunkSize, contentLength-start)
-			
-			// Read part data
-			if _, err := io.ReadFull(reader, buffer[:size]); err != nil {
-				errChan <- fmt.Errorf("failed to read part %d: %v", partNum, err)
+			if err != nil {
+				results <- partResult{Err: fmt.Errorf("failed to upload part %d: %v", num, err)}
 				return
 			}
 
-			// Upload part with retries
-			for retry := 0; retry < maxRetries; retry++ {
-				part, err := uploadPart(ctx, client, r2cfg.BucketName, key, uploadID, partNum, buffer[:size])
-				if err == nil {
-					completedParts <- part
-					if progress != nil {
-						progress.uploadedBytes.Add(size)
-						progress.progressBar.SetCurrent(progress.uploadedBytes.Load())
-					}
-					return
-				}
-				
-				if retry < maxRetries-1 {
-					time.Sleep(retryDelay)
-				}
+			results <- partResult{
+				Part: types.CompletedPart{
+					PartNumber: aws.Int32(num),
+					ETag:       partResp.ETag,
+				},
 			}
-			errChan <- fmt.Errorf("failed to upload part %d after %d retries", partNum, maxRetries)
-		}(partNum)
+
+			if progress != nil {
+				progress.Add(int64(len(buf)))
+			}
+		}(partNum, buffer[:n])
+
+		partNum++
+		remainingBytes -= int64(n)
 	}
 
-	// Wait for completion
+	// Wait for all parts to complete
 	go func() {
 		wg.Wait()
-		close(completedParts)
-		close(errChan)
+		close(results)
 	}()
 
 	// Collect results
-	for part := range completedParts {
-		parts = append(parts, part)
-	}
-
-	// Check for errors
-	var uploadErrors []error
-	for err := range errChan {
-		if err != nil {
-			uploadErrors = append(uploadErrors, err)
+	var uploadErr error
+	for result := range results {
+		if result.Err != nil {
+			uploadErr = result.Err
+			break
 		}
+		parts = append(parts, result.Part)
 	}
 
-	if len(uploadErrors) > 0 {
-		// Abort upload on errors
-		_, _ = client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+	if uploadErr != nil {
+		// Abort upload on error
+		_, abortErr := client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
 			Bucket:   aws.String(r2cfg.BucketName),
 			Key:      aws.String(key),
 			UploadId: aws.String(uploadID),
 		})
-		return fmt.Errorf("upload errors: %v", uploadErrors)
+		if abortErr != nil {
+			fmt.Printf("Warning: Failed to abort upload after error: %v\n", abortErr)
+		}
+		return uploadErr
 	}
 
-	// Complete multipart upload
+	// Sort parts by part number
 	sort.Slice(parts, func(i, j int) bool {
 		return *parts[i].PartNumber < *parts[j].PartNumber
 	})
 
+	// Complete upload
 	_, err = client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
 		Bucket:          aws.String(r2cfg.BucketName),
 		Key:             aws.String(key),
@@ -730,29 +823,6 @@ func streamMultipartToR2(ctx context.Context, r2cfg R2Config, reader io.Reader, 
 	})
 
 	return err
-}
-
-// Helper function for uploading individual parts
-func uploadPart(ctx context.Context, client *s3.Client, bucket, key, uploadID string, partNum int64, data []byte) (types.CompletedPart, error) {
-	contentLength := int64(len(data))
-	input := &s3.UploadPartInput{
-		Bucket:        aws.String(bucket),
-		Key:           aws.String(key),
-		PartNumber:    aws.Int32(int32(partNum)),
-		UploadId:      aws.String(uploadID),
-		Body:          bytes.NewReader(data),
-		ContentLength: &contentLength,
-	}
-	
-	result, err := client.UploadPart(ctx, input)
-	if err != nil {
-		return types.CompletedPart{}, err
-	}
-	
-	return types.CompletedPart{
-		ETag:       result.ETag,
-		PartNumber: aws.Int32(int32(partNum)),
-	}, nil
 }
 
 // Optimize S3 client configuration
@@ -919,36 +989,11 @@ func streamToR2(ctx context.Context, r2cfg R2Config, reader io.Reader, key strin
 	return err
 }
 
-// Progress reader implementation
-type progressReader struct {
-	reader   io.Reader
-	progress *uploadProgress
-	buffer   *bufio.Reader
-}
-
-func newProgressReader(reader io.Reader, progress *uploadProgress) *progressReader {
-	return &progressReader{
-		reader:   reader,
-		progress: progress,
-		buffer:   bufio.NewReaderSize(reader, bufferSize),
-	}
-}
-
-func (r *progressReader) Read(p []byte) (int, error) {
-	n, err := r.buffer.Read(p)
-	if n > 0 && r.progress != nil {
-		r.progress.uploadedBytes.Add(int64(n))
-		r.progress.progressBar.SetCurrent(r.progress.uploadedBytes.Load())
-	}
-	return n, err
-}
-
 // Helper function for simple uploads
 func streamSimpleToR2(ctx context.Context, r2cfg R2Config, reader io.Reader, key string, contentLength int64, progress *uploadProgress) error {
 	if progress == nil {
 		progress = createProgressBar(contentLength, filepath.Base(key))
 	}
-	defer progress.progress.Wait()
 
 	client := createR2Client(ctx, r2cfg)
 	progressReader := newProgressReader(reader, progress)
@@ -956,7 +1001,7 @@ func streamSimpleToR2(ctx context.Context, r2cfg R2Config, reader io.Reader, key
 	length := contentLength
 	_, err := client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:        aws.String(r2cfg.BucketName),
-		Key:           aws.String(key),  // This will now use the properly prefixed key
+		Key:           aws.String(key),
 		Body:          progressReader,
 		ContentLength: &length,
 	})
@@ -971,29 +1016,3 @@ func min(a, b int64) int64 {
 	return b
 }
 
-// Add function to create progress bar
-func createProgressBar(total int64, filename string) *uploadProgress {
-	p := mpb.New(
-		mpb.WithWidth(60),
-		mpb.WithRefreshRate(180*time.Millisecond),
-	)
-
-	bar := p.New(total,
-		mpb.BarStyle().Lbound("[").Filler("=").Tip(">").Padding("-").Rbound("]"),
-		mpb.PrependDecorators(
-			decor.Name(fmt.Sprintf("Uploading %s ", filename), decor.WCSyncWidth),
-			decor.CountersKibiByte("%.2f / %.2f"),
-		),
-		mpb.AppendDecorators(
-			decor.Percentage(),
-			decor.AverageSpeed(decor.SizeB1024(0), " %.1f"),
-			decor.Elapsed(decor.ET_STYLE_GO),
-		),
-	)
-
-	return &uploadProgress{
-		totalBytes:  total,
-		progressBar: bar,
-		progress:    p,
-	}
-}
