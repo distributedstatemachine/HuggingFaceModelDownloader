@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -115,6 +116,7 @@ func main() {
 	var (
 		install     bool
 		installPath string
+		cleanupCorrupted bool
 	)
 	ShortString := fmt.Sprintf("a Simple HuggingFace Models Downloader Utility\nVersion: %s", VERSION)
 	currentPath, err := os.Executable()
@@ -217,6 +219,15 @@ func main() {
 				}
 			}
 
+			if cleanupCorrupted {
+				ctx := context.Background()
+				if err := hfd.CleanupCorruptedFiles(ctx, r2cfg, ModelOrDataSet); err != nil {
+					log.Fatalf("Failed to cleanup corrupted files: %v", err)
+				}
+				fmt.Println("Cleanup completed")
+				return nil
+			}
+
 			for i := 0; i < config.MaxRetries; i++ {
 				if err := hfd.DownloadModel(
 					ModelOrDataSet,          // model name
@@ -277,6 +288,7 @@ func main() {
 	rootCmd.PersistentFlags().StringVar(&config.R2AccessKey, "r2-access-key", "", "R2 access key")
 	rootCmd.PersistentFlags().StringVar(&config.R2SecretKey, "r2-secret-key", "", "R2 secret key")
 	rootCmd.PersistentFlags().BoolVar(&config.SkipLocal, "skip-local", false, "Skip local storage when using R2")
+	rootCmd.PersistentFlags().BoolVar(&cleanupCorrupted, "cleanup-corrupted", false, "Clean up corrupted parquet files")
 
 	if err := rootCmd.Execute(); err != nil {
 		log.Fatalln("Error:", err)
