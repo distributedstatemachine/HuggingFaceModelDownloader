@@ -33,16 +33,16 @@ type Config struct {
 	SkipSHA            bool   `json:"skip_sha"`
 	// Install            bool   `json:"install"`
 	// InstallPath        string `json:"install_path"`
-	MaxRetries    int  `json:"max_retries"`
-	RetryInterval int  `json:"retry_interval"`
-	JustDownload  bool `json:"just_download"`
-	SilentMode    bool `json:"silent_mode"`
-	UseR2           bool   `json:"use_r2"`
-	R2BucketName    string `json:"r2_bucket_name"`
-	R2AccountID     string `json:"r2_account_id"`
-	R2AccessKey     string `json:"r2_access_key"`
-	R2SecretKey     string `json:"r2_secret_key"`
-	SkipLocal       bool   `json:"skip_local"`
+	MaxRetries    int    `json:"max_retries"`
+	RetryInterval int    `json:"retry_interval"`
+	JustDownload  bool   `json:"just_download"`
+	SilentMode    bool   `json:"silent_mode"`
+	UseR2         bool   `json:"use_r2"`
+	R2BucketName  string `json:"r2_bucket_name"`
+	R2AccountID   string `json:"r2_account_id"`
+	R2AccessKey   string `json:"r2_access_key"`
+	R2SecretKey   string `json:"r2_secret_key"`
+	SkipLocal     bool   `json:"skip_local"`
 }
 
 // DefaultConfig returns a config instance populated with default values.
@@ -114,8 +114,8 @@ func main() {
 	}
 	var justDownload bool
 	var (
-		install     bool
-		installPath string
+		install          bool
+		installPath      string
 		cleanupCorrupted bool
 	)
 	ShortString := fmt.Sprintf("a Simple HuggingFace Models Downloader Utility\nVersion: %s", VERSION)
@@ -230,17 +230,17 @@ func main() {
 
 			for i := 0; i < config.MaxRetries; i++ {
 				if err := hfd.DownloadModel(
-					ModelOrDataSet,          // model name
+					ModelOrDataSet,            // model name
 					config.OneFolderPerFilter, // append filter to path
-					config.SkipSHA,          // skip SHA check
-					IsDataset,               // is dataset
-					config.Storage,          // local temp path
-					config.Branch,           // branch
-					config.NumConnections,   // concurrent connections
-					config.AuthToken,        // HF token
-					config.SilentMode,       // silent mode
-					r2cfg,                   // R2 config
-					config.SkipLocal,        // skipLocal - use SkipLocal flag
+					config.SkipSHA,            // skip SHA check
+					IsDataset,                 // is dataset
+					config.Storage,            // local temp path
+					config.Branch,             // branch
+					config.NumConnections,     // concurrent connections
+					config.AuthToken,          // HF token
+					config.SilentMode,         // silent mode
+					r2cfg,                     // R2 config
+					config.SkipLocal,          // skipLocal - use SkipLocal flag
 				); err != nil {
 					fmt.Printf("Warning: attempt %d / %d failed, error: %s\n", i+1, config.MaxRetries, err)
 					time.Sleep(time.Duration(config.RetryInterval) * time.Second)

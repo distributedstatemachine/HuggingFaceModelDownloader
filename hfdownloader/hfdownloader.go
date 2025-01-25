@@ -27,10 +27,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"context"
 	"bytes"
-	// "crypto/md5"
-	// "encoding/base64"
 	"github.com/schollz/progressbar/v3"
-	// "bufio"
 	"net"
 )
 
