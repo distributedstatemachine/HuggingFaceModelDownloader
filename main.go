@@ -43,6 +43,7 @@ type Config struct {
 	R2AccessKey   string `json:"r2_access_key"`
 	R2SecretKey   string `json:"r2_secret_key"`
 	SkipLocal     bool   `json:"skip_local"`
+	R2Subfolder   string `json:"r2_subfolder"`
 }
 
 // DefaultConfig returns a config instance populated with default values.
@@ -53,6 +54,7 @@ func DefaultConfig() Config {
 		Storage:        "./",
 		MaxRetries:     3,
 		RetryInterval:  5,
+		R2Subfolder:    "HuggingFaceFW_fineweb-edu-score-2",
 	}
 }
 
@@ -198,16 +200,24 @@ func main() {
 				accountID := os.Getenv("R2_ACCOUNT_ID")
 				accessKey := os.Getenv("R2_WRITE_ACCESS_KEY_ID")
 				secretKey := os.Getenv("R2_WRITE_SECRET_ACCESS_KEY")
-
-				// Validate R2 configuration
 				if accountID == "" || accessKey == "" || secretKey == "" {
 					log.Fatal("R2 credentials not found in environment variables")
 				}
 
-				// Use account ID as bucket name if not specified
+				// Use config.R2BucketName if provided; otherwise, try the env variable R2_BUCKET_NAME;
+				// if still empty, fallback to accountID.
 				bucketName := config.R2BucketName
 				if bucketName == "" {
-					bucketName = accountID
+					bucketName = os.Getenv("R2_BUCKET_NAME")
+					if bucketName == "" {
+						bucketName = accountID
+					}
+				}
+
+				// Use the provided subfolder or default if empty
+				subfolder := config.R2Subfolder
+				if subfolder == "" {
+					subfolder = "HuggingFaceFW_fineweb-edu-score-2"
 				}
 
 				r2cfg = &hfd.R2Config{
@@ -216,12 +226,14 @@ func main() {
 					AccessKeySecret: secretKey,
 					BucketName:      bucketName,
 					Region:          "auto",
+					Subfolder:       subfolder,
 				}
 			}
 
 			if cleanupCorrupted {
 				ctx := context.Background()
-				if err := hfd.CleanupCorruptedFiles(ctx, r2cfg, ModelOrDataSet); err != nil {
+				prefix := r2cfg.Subfolder + "/" // ensure trailing slash so keys match
+				if err := hfd.CleanupCorruptedFiles(ctx, r2cfg, prefix, config.NumConnections); err != nil {
 					log.Fatalf("Failed to cleanup corrupted files: %v", err)
 				}
 				fmt.Println("Cleanup completed")
@@ -289,6 +301,7 @@ func main() {
 	rootCmd.PersistentFlags().StringVar(&config.R2SecretKey, "r2-secret-key", "", "R2 secret key")
 	rootCmd.PersistentFlags().BoolVar(&config.SkipLocal, "skip-local", false, "Skip local storage when using R2")
 	rootCmd.PersistentFlags().BoolVar(&cleanupCorrupted, "cleanup-corrupted", false, "Clean up corrupted parquet files")
+	rootCmd.PersistentFlags().StringVar(&config.R2Subfolder, "r2-subfolder", config.R2Subfolder, "Subfolder on your R2 bucket (e.g. HuggingFaceFW_fineweb-edu-score-2)")
 
 	if err := rootCmd.Execute(); err != nil {
 		log.Fatalln("Error:", err)

@@ -19,16 +19,17 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/fatih/color"
+	"bytes"
+	"context"
+	"net"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"context"
-	"bytes"
+	"github.com/fatih/color"
 	"github.com/schollz/progressbar/v3"
-	"net"
 )
 
 const (
@@ -41,13 +42,13 @@ const (
 	JsonModelsFileTreeURL  = "https://huggingface.co/api/models/%s/tree/%s/%s"
 	JsonDatasetFileTreeURL = "https://huggingface.co/api/datasets/%s/tree/%s/%s"
 	// Optimize for high-speed downloads
-	streamBufferSize    = 256 * 1024 * 1024  // 256MB buffer
-	multipartThreshold  = 1024 * 1024 * 1024 // 1GB threshold
-	chunkSize          = 256 * 1024 * 1024  // 256MB chunks
-	maxConcurrent      = 16                   // 8 concurrent files
-	maxPartsPerFile    = 32                  // 16 concurrent chunks per file
-	bufferSize         = 128 * 1024 * 1024  // 128MB buffer
-	maxRetries         = 3                    // Reduced retries for faster failure recovery
+	streamBufferSize   = 256 * 1024 * 1024      // 256MB buffer
+	multipartThreshold = 1024 * 1024 * 1024     // 1GB threshold
+	chunkSize          = 256 * 1024 * 1024      // 256MB chunks
+	maxConcurrent      = 16                     // 8 concurrent files
+	maxPartsPerFile    = 32                     // 16 concurrent chunks per file
+	bufferSize         = 128 * 1024 * 1024      // 128MB buffer
+	maxRetries         = 3                      // Reduced retries for faster failure recovery
 	retryDelay         = 500 * time.Millisecond // Shorter retry delay
 )
 
@@ -56,7 +57,7 @@ var (
 	successColor   = color.New(color.FgHiGreen).SprintFunc()
 	warningColor   = color.New(color.FgYellow).SprintFunc()
 	errorColor     = color.New(color.FgRed).SprintFunc()
-	NumConnections = 64  // Increased from 5 to 32
+	NumConnections = 64 // Increased from 5 to 32
 	RequiresAuth   = false
 	AuthToken      = ""
 )
@@ -88,8 +89,9 @@ type R2Config struct {
 	AccountID       string
 	AccessKeyID     string
 	AccessKeySecret string
-	BucketName     string
-	Region         string // Usually "auto" for R2
+	BucketName      string
+	Region          string // Usually "auto" for R2
+	Subfolder       string // Custom subfolder (e.g., "HuggingFaceFW_fineweb-edu-score-2")
 }
 
 type uploadProgress struct {
@@ -129,7 +131,7 @@ func createProgressBar(total int64, filename string) *uploadProgress {
 			fmt.Printf("\n")
 		}),
 	)
-	
+
 	return &uploadProgress{
 		progress: bar,
 	}
@@ -164,11 +166,11 @@ func buildR2Cache(ctx context.Context, r2cfg *R2Config, prefix string) (*R2FileC
 
 	fmt.Printf("Building cache of existing files in R2...\n")
 	start := time.Now()
-	
+
 	// Use paginator for large buckets
 	paginator := s3.NewListObjectsV2Paginator(client, input)
 	count := 0
-	
+
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
@@ -179,7 +181,7 @@ func buildR2Cache(ctx context.Context, r2cfg *R2Config, prefix string) (*R2FileC
 			cache.files[*obj.Key] = struct{}{}
 			count++
 		}
-		
+
 		if count%1000 == 0 {
 			fmt.Printf("Cached %d files...\n", count)
 		}
@@ -201,14 +203,14 @@ func (c *R2FileCache) Exists(key string) bool {
 func DownloadModel(ModelDatasetName string, AppendFilterToPath bool, SkipSHA bool, IsDataset bool, DestinationBasePath string, ModelBranch string, concurrentConnections int, token string, silentMode bool, r2cfg *R2Config, skipLocal bool) error {
 	// Build cache of existing files
 	ctx := context.Background()
-	cache, err := buildR2Cache(ctx, r2cfg, "HuggingFaceFW_fineweb-edu-score-2/")
+	cache, err := buildR2Cache(ctx, r2cfg, r2cfg.Subfolder+"/")
 	if err != nil {
 		return fmt.Errorf("failed to build R2 cache: %v", err)
 	}
 
 	modelP := strings.Split(ModelDatasetName, ":")[0]
 	modelPath := filepath.Join(DestinationBasePath, modelP)
-	
+
 	// Create R2 client for checking existing files
 	// r2Client := createR2Client(ctx, *r2cfg)
 
@@ -223,8 +225,8 @@ func DownloadModel(ModelDatasetName string, AppendFilterToPath bool, SkipSHA boo
 		go func(workerID int) {
 			defer wg.Done()
 			for file := range jobs {
-				r2Key := fmt.Sprintf("HuggingFaceFW_fineweb-edu-score-2/%s", strings.TrimPrefix(file.Path, "data/"))
-				
+				r2Key := fmt.Sprintf("%s/%s", r2cfg.Subfolder, strings.TrimPrefix(file.Path, "data/"))
+
 				// Fast cache lookup instead of HeadObject
 				if cache.Exists(r2Key) {
 					if !silentMode {
@@ -269,7 +271,7 @@ func DownloadModel(ModelDatasetName string, AppendFilterToPath bool, SkipSHA boo
 
 				// Create progress bar
 				progress := createProgressBar(int64(file.Size), filepath.Base(file.Path))
-				
+
 				// Upload to R2
 				var uploadErr error
 				if int64(file.Size) > multipartThreshold {
@@ -295,7 +297,7 @@ func DownloadModel(ModelDatasetName string, AppendFilterToPath bool, SkipSHA boo
 					if deleteErr != nil {
 						fmt.Printf("Warning: Failed to delete corrupted file %s: %v\n", r2Key, deleteErr)
 					}
-					
+
 					results <- fmt.Errorf("file verification failed for %s: %v", r2Key, err)
 					continue
 				}
@@ -316,17 +318,16 @@ func DownloadModel(ModelDatasetName string, AppendFilterToPath bool, SkipSHA boo
 		// First, filter files that need to be processed
 		for _, file := range files {
 			if !file.IsDirectory && !file.FilterSkip && file.Size > 0 {
-				r2Key := fmt.Sprintf("HuggingFaceFW_fineweb-edu-score-2/%s", 
-					strings.TrimPrefix(file.Path, "data/"))
-				
+				r2Key := fmt.Sprintf("%s/%s", r2cfg.Subfolder, strings.TrimPrefix(file.Path, "data/"))
+
 				totalSize += int64(file.Size)
-				
+
 				if cache.Exists(r2Key) {
 					skippedSize += int64(file.Size)
 					skippedCount++
 					continue
 				}
-				
+
 				pendingFiles = append(pendingFiles, file)
 			}
 		}
@@ -702,7 +703,7 @@ func downloadFileMultiThread(tempFolder, url, outputFileName string, silentMode 
 			ReadBufferSize:      64 * 1024, // 64KB
 		},
 	}
-	
+
 	req, err := client.Head(url)
 	if err != nil {
 		return err
@@ -723,7 +724,7 @@ func downloadFileMultiThread(tempFolder, url, outputFileName string, silentMode 
 		go func() {
 			defer wg.Done()
 			defer pw.Close()
-			
+
 			ctx := context.Background()
 			r2Key := strings.TrimPrefix(outputFileName, "/")
 			uploadErr = streamMultipartToR2(ctx, *r2cfg, pr, r2Key, int64(contentLength), nil)
@@ -745,7 +746,7 @@ func downloadFileMultiThread(tempFolder, url, outputFileName string, silentMode 
 		downloadWg.Add(1)
 		go func(i int, start, end int64) {
 			defer downloadWg.Done()
-			
+
 			err := downloadChunkToWriter(url, start, end, pw)
 			if err != nil {
 				errChan <- fmt.Errorf("chunk %d download failed: %v", i, err)
@@ -766,7 +767,7 @@ func downloadFileMultiThread(tempFolder, url, outputFileName string, silentMode 
 
 	// Wait for upload to complete
 	wg.Wait()
-	
+
 	if uploadErr != nil {
 		return fmt.Errorf("R2 upload failed: %v", uploadErr)
 	}
@@ -1042,7 +1043,7 @@ func uploadToR2(ctx context.Context, r2cfg R2Config, localPath string, r2Key str
 		Key:    aws.String(r2Key),
 		Body:   file,
 	})
-	
+
 	return err
 }
 
@@ -1059,11 +1060,11 @@ func downloadChunkToWriter(url string, start, end int64, writer io.Writer) error
 	if err != nil {
 		return err
 	}
-	
+
 	if RequiresAuth {
 		req.Header.Add("Authorization", "Bearer "+AuthToken)
 	}
-	
+
 	rangeHeader := fmt.Sprintf("bytes=%d-%d", start, end-1)
 	req.Header.Add("Range", rangeHeader)
 
@@ -1129,7 +1130,7 @@ func streamSimpleToR2(ctx context.Context, r2cfg R2Config, reader io.Reader, key
 
 	client := createR2Client(ctx, r2cfg)
 	progressReader := newProgressReader(reader, progress)
-	
+
 	length := contentLength
 	_, err := client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:        aws.String(r2cfg.BucketName),
@@ -1169,7 +1170,7 @@ func min(a, b int64) int64 {
 
 func verifyParquetFile(ctx context.Context, r2cfg *R2Config, key string, expectedSize int64) error {
 	client := createR2Client(ctx, *r2cfg)
-	
+
 	// Get first 4 bytes
 	headerObj, err := client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(r2cfg.BucketName),
@@ -1251,104 +1252,120 @@ func verifyLocalParquet(filePath string) error {
 	return nil
 }
 
-func CleanupCorruptedFiles(ctx context.Context, r2cfg *R2Config, prefix string) error {
-	if r2cfg == nil {
-		return fmt.Errorf("R2 config is required")
-	}
-
+func CleanupCorruptedFiles(ctx context.Context, r2cfg *R2Config, prefix string, concurrency int) error {
 	client := createR2Client(ctx, *r2cfg)
-	count := 0
-	corrupted := 0
-	
-	// Fix the prefix to match the actual bucket structure
-	bucketPrefix := "HuggingFaceFW_fineweb-edu-score-2/"
-	
-	fmt.Printf("Checking parquet files in R2 bucket: %s\n", r2cfg.BucketName)
-	fmt.Printf("Starting from prefix: %s\n", bucketPrefix)
-	
-	// First, list CC-MAIN folders
-	input := &s3.ListObjectsV2Input{
-		Bucket:    aws.String(r2cfg.BucketName),
-		Prefix:    aws.String(bucketPrefix),
-		Delimiter: aws.String("/"),
+	var wg sync.WaitGroup
+	jobs := make(chan *types.Object, concurrency*2) // buffered channel for efficiency
+	var totalFiles, corruptedFiles int32
+
+	// Worker function to process verification for each parquet file.
+	worker := func(workerID int) {
+		defer wg.Done()
+		for obj := range jobs {
+			if !strings.HasSuffix(*obj.Key, ".parquet") || *obj.Size < 8 {
+				continue
+			}
+
+			fmt.Printf("[Worker %d] Checking file: %s (size: %s)\n", workerID, *obj.Key, formatSize(*obj.Size))
+			err := verifyParquetFile(ctx, r2cfg, *obj.Key, *obj.Size)
+			// If header/footer check passed, then perform full checksum validation if metadata is available
+			if err == nil {
+				// Retrieve object's metadata to get expected checksum
+				head, headErr := client.HeadObject(ctx, &s3.HeadObjectInput{
+					Bucket: aws.String(r2cfg.BucketName),
+					Key:    obj.Key,
+				})
+				if headErr == nil {
+					if expected, ok := head.Metadata["sha256"]; ok && expected != "" {
+						fmt.Printf("[Worker %d] Verifying checksum for: %s (expected: %s)\n", workerID, *obj.Key, expected)
+						err = verifyRemoteFileChecksum(ctx, r2cfg, *obj.Key, expected)
+					} else {
+						fmt.Printf("[Worker %d] No sha256 metadata for: %s, skipping checksum\n", workerID, *obj.Key)
+					}
+				} else {
+					fmt.Printf("[Worker %d] Failed to retrieve metadata for: %s, skipping checksum (error: %v)\n", workerID, *obj.Key, headErr)
+				}
+			}
+
+			atomic.AddInt32(&totalFiles, 1)
+			if err != nil {
+				atomic.AddInt32(&corruptedFiles, 1)
+				fmt.Printf("[Worker %d] ❌ Corrupted file: %s, error: %v\n", workerID, *obj.Key, err)
+				if strings.Contains(err.Error(), "invalid parquet") {
+					_, delErr := client.DeleteObject(ctx, &s3.DeleteObjectInput{
+						Bucket: aws.String(r2cfg.BucketName),
+						Key:    obj.Key,
+					})
+					if delErr != nil {
+						fmt.Printf("[Worker %d] Warning: Failed to delete file %s: %v\n", workerID, *obj.Key, delErr)
+					} else {
+						fmt.Printf("[Worker %d] Deleted corrupted file: %s\n", workerID, *obj.Key)
+					}
+				}
+			} else {
+				fmt.Printf("[Worker %d] ✅ Valid parquet file: %s\n", workerID, *obj.Key)
+			}
+		}
 	}
 
+	// Spawn the specified number of workers.
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go worker(i)
+	}
+
+	// List objects from R2 using the provided prefix.
+	input := &s3.ListObjectsV2Input{
+		Bucket: aws.String(r2cfg.BucketName),
+		Prefix: aws.String(prefix),
+	}
 	paginator := s3.NewListObjectsV2Paginator(client, input)
-	
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
-			return fmt.Errorf("failed to list folders: %v", err)
+			close(jobs)
+			wg.Wait()
+			return fmt.Errorf("failed to list objects: %v", err)
 		}
-
-		// Process each CC-MAIN folder
-		for _, commonPrefix := range page.CommonPrefixes {
-			folderPrefix := *commonPrefix.Prefix
-			fmt.Printf("\nChecking folder: %s\n", folderPrefix)
-
-			// List parquet files in this folder
-			parquetInput := &s3.ListObjectsV2Input{
-				Bucket: aws.String(r2cfg.BucketName),
-				Prefix: aws.String(folderPrefix),
-			}
-
-			parquetPaginator := s3.NewListObjectsV2Paginator(client, parquetInput)
-			
-			for parquetPaginator.HasMorePages() {
-				parquetPage, err := parquetPaginator.NextPage(ctx)
-				if err != nil {
-					return fmt.Errorf("failed to list parquet files: %v", err)
-				}
-
-				for _, obj := range parquetPage.Contents {
-					if !strings.HasSuffix(*obj.Key, ".parquet") {
-						continue
-					}
-
-					count++
-					fmt.Printf("Checking file %d: %s (size: %s)\n", count, *obj.Key, formatSize(*obj.Size))
-
-					if *obj.Size < 8 {
-						fmt.Printf("Warning: File too small to be a valid parquet file: %s\n", *obj.Key)
-						continue
-					}
-
-					err := verifyParquetFile(ctx, r2cfg, *obj.Key, *obj.Size)
-					if err != nil {
-						corrupted++
-						fmt.Printf("❌ Corrupted file: %s\n", *obj.Key)
-						fmt.Printf("   Error: %v\n", err)
-						
-						// Only delete if we're sure it's corrupted (not just a failed check)
-						if strings.Contains(err.Error(), "invalid parquet") {
-							_, delErr := client.DeleteObject(ctx, &s3.DeleteObjectInput{
-								Bucket: aws.String(r2cfg.BucketName),
-								Key:    obj.Key,
-							})
-							if delErr != nil {
-								fmt.Printf("   Warning: Failed to delete: %v\n", delErr)
-							} else {
-								fmt.Printf("   ✓ Deleted corrupted file\n")
-							}
-						} else {
-							fmt.Printf("   ⚠️  Skipping deletion due to verification error\n")
-						}
-					} else {
-						fmt.Printf("✅ Valid parquet file\n")
-					}
-				}
-			}
+		fmt.Printf("Retrieved %d objects with prefix %s\n", len(page.Contents), prefix)
+		for _, obj := range page.Contents {
+			// send pointer to a copy to avoid the type error
+			o := obj
+			jobs <- &o
 		}
 	}
+	close(jobs)
+	wg.Wait()
 
 	fmt.Printf("\n=== Summary ===\n")
-	fmt.Printf("Total parquet files checked: %d\n", count)
-	fmt.Printf("Corrupted files found: %d\n", corrupted)
-	if count == 0 {
-		fmt.Printf("\nWarning: No parquet files found! Please verify the bucket and prefix.\n")
+	fmt.Printf("Total parquet files checked: %d\n", totalFiles)
+	fmt.Printf("Corrupted files found: %d\n", corruptedFiles)
+	if totalFiles == 0 {
+		fmt.Printf("Warning: No parquet files found! Verify bucket and prefix.\n")
 	}
-	fmt.Printf("\nVerification complete!\n")
-
+	fmt.Printf("Verification complete!\n")
 	return nil
 }
 
+// Add this helper function to hfdownloader/hfdownloader.go
+func verifyRemoteFileChecksum(ctx context.Context, r2cfg *R2Config, key string, expectedChecksum string) error {
+	client := createR2Client(ctx, *r2cfg)
+	obj, err := client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(r2cfg.BucketName),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to download file for checksum: %v", err)
+	}
+	defer obj.Body.Close()
+
+	hash := sha256.New()
+	if _, err := io.Copy(hash, obj.Body); err != nil {
+		return fmt.Errorf("failed to compute checksum: %v", err)
+	}
+	computed := hex.EncodeToString(hash.Sum(nil))
+	if computed != expectedChecksum {
+		return fmt.Errorf("checksum mismatch: computed %s, expected %s", computed, expectedChecksum)
+	}
+	return nil
+}
