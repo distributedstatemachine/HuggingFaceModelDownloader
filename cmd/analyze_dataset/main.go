@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+
 	// "path/filepath"
 	"sort"
 	"strings"
@@ -83,15 +84,15 @@ func fetchAllFiles(modelName, branch, basePath string) ([]hfmodel, error) {
 ////////////////////////////////////////////////////////////////////////////////
 
 func analyzeDataset(modelName, branch string) error {
-	fmt.Printf("Fetching everything under /data ...\n")
+	fmt.Printf("Fetching everything ...\n")
 
-	all, err := fetchAllFiles(modelName, branch, "data")
+	all, err := fetchAllFiles(modelName, branch, "/")
 	if err != nil {
 		return fmt.Errorf("failed BFS fetch: %v", err)
 	}
 
 	if len(all) == 0 {
-		return fmt.Errorf("no items found under `data`")
+		return fmt.Errorf("no items found")
 	}
 
 	// 1) Summarize total data folder
@@ -148,12 +149,12 @@ func analyzeDataset(modelName, branch string) error {
 	fmt.Printf("Dataset: %s\n", modelName)
 	fmt.Printf("Branch: %s\n", branch)
 
-	fmt.Println("\n/data folder overview:")
+	fmt.Println("\nfolder overview:")
 	fmt.Println("-------------------------------------------------------")
 	fmt.Printf("Total files (including subfolders): %d\n", dataFilesCount)
-	fmt.Printf("Total size of /data: %s\n", formatSize(dataTotalSize))
+	fmt.Printf("Total size: %s\n", formatSize(dataTotalSize))
 
-	fmt.Println("\nAll Folders under /data:")
+	fmt.Println("\nAll Folders:")
 	fmt.Println("-------------------------------------------------------")
 	for _, p := range sortedPaths {
 		stats := folderStats[p]
@@ -197,7 +198,7 @@ func fetchFileList(url string) ([]hfmodel, error) {
 }
 
 func main() {
-	modelName := "HuggingFaceFW/fineweb-edu-score-2"
+	modelName := "mlfoundations/dclm-baseline-1.0-parquet"
 	branch := "main"
 	if err := analyzeDataset(modelName, branch); err != nil {
 		fmt.Printf("Error: %v\n", err)

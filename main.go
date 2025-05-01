@@ -44,6 +44,7 @@ type Config struct {
 	R2SecretKey   string `json:"r2_secret_key"`
 	SkipLocal     bool   `json:"skip_local"`
 	R2Subfolder   string `json:"r2_subfolder"`
+	HFPrefix      string `json:"hf_prefix"`
 }
 
 // DefaultConfig returns a config instance populated with default values.
@@ -54,7 +55,7 @@ func DefaultConfig() Config {
 		Storage:        "./",
 		MaxRetries:     3,
 		RetryInterval:  5,
-		R2Subfolder:    "HuggingFaceFW_fineweb-edu-score-2",
+		R2Subfolder:    "hf_dataset",
 	}
 }
 
@@ -217,7 +218,7 @@ func main() {
 				// Use the provided subfolder or default if empty
 				subfolder := config.R2Subfolder
 				if subfolder == "" {
-					subfolder = "HuggingFaceFW_fineweb-edu-score-2"
+					subfolder = "hf_dataset"
 				}
 
 				r2cfg = &hfd.R2Config{
@@ -253,6 +254,7 @@ func main() {
 					config.SilentMode,         // silent mode
 					r2cfg,                     // R2 config
 					config.SkipLocal,          // skipLocal - use SkipLocal flag
+					config.HFPrefix,           // HF prefix
 				); err != nil {
 					fmt.Printf("Warning: attempt %d / %d failed, error: %s\n", i+1, config.MaxRetries, err)
 					time.Sleep(time.Duration(config.RetryInterval) * time.Second)
@@ -301,7 +303,8 @@ func main() {
 	rootCmd.PersistentFlags().StringVar(&config.R2SecretKey, "r2-secret-key", "", "R2 secret key")
 	rootCmd.PersistentFlags().BoolVar(&config.SkipLocal, "skip-local", false, "Skip local storage when using R2")
 	rootCmd.PersistentFlags().BoolVar(&cleanupCorrupted, "cleanup-corrupted", false, "Clean up corrupted parquet files")
-	rootCmd.PersistentFlags().StringVar(&config.R2Subfolder, "r2-subfolder", config.R2Subfolder, "Subfolder on your R2 bucket (e.g. HuggingFaceFW_fineweb-edu-score-2)")
+	rootCmd.PersistentFlags().StringVar(&config.R2Subfolder, "r2-subfolder", config.R2Subfolder, "Subfolder on your R2 bucket (e.g. hf_dataset)")
+	rootCmd.PersistentFlags().StringVar(&config.HFPrefix, "hf-prefix", "", "Optional prefix to only fetch files from a specific folder in the HF datasets repo")
 
 	if err := rootCmd.Execute(); err != nil {
 		log.Fatalln("Error:", err)
