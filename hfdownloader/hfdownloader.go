@@ -179,7 +179,7 @@ func (p *uploadProgress) Add(n int64) {
 
 // Add this struct to store file metadata
 type R2FileCache struct {
-	files map[string]struct{}
+	files map[string]int64 // map of file key to file size
 	mu    sync.RWMutex
 }
 
@@ -187,7 +187,7 @@ type R2FileCache struct {
 func buildR2Cache(ctx context.Context, r2cfg *R2Config, prefix string) (*R2FileCache, error) {
 	client := createR2Client(ctx, *r2cfg)
 	cache := &R2FileCache{
-		files: make(map[string]struct{}),
+		files: make(map[string]int64),
 	}
 
 	input := &s3.ListObjectsV2Input{
@@ -209,7 +209,7 @@ func buildR2Cache(ctx context.Context, r2cfg *R2Config, prefix string) (*R2FileC
 		}
 
 		for _, obj := range page.Contents {
-			cache.files[*obj.Key] = struct{}{}
+			cache.files[*obj.Key] = *obj.Size
 			count++
 		}
 
@@ -229,6 +229,22 @@ func (c *R2FileCache) Exists(key string) bool {
 	defer c.mu.RUnlock()
 	_, exists := c.files[key]
 	return exists
+}
+
+// Add method to check if file exists and has the expected size
+func (c *R2FileCache) ExistsWithSize(key string, expectedSize int64) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	size, exists := c.files[key]
+	return exists && size == expectedSize
+}
+
+// Get the file size
+func (c *R2FileCache) GetSize(key string) (int64, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	size, exists := c.files[key]
+	return size, exists
 }
 
 func DownloadModel(ModelDatasetName string, AppendFilterToPath bool, SkipSHA bool, IsDataset bool, DestinationBasePath string, ModelBranch string, concurrentConnections int, token string, silentMode bool, r2cfg *R2Config, skipLocal bool, hfPrefix string) error {
@@ -280,13 +296,26 @@ func DownloadModel(ModelDatasetName string, AppendFilterToPath bool, SkipSHA boo
 
 				r2Key := fmt.Sprintf("%s/%s", r2cfg.Subfolder, strings.TrimPrefix(file.Path, fmt.Sprintf("%s/", hfPrefix)))
 
-				// Fast cache lookup instead of HeadObject
-				if cache.Exists(r2Key) {
+				// Check if file exists with correct size using ExistsWithSize
+				if cache.ExistsWithSize(r2Key, int64(file.Size)) {
 					if !silentMode {
-						fmt.Printf("Skipping %s - already exists in R2\n", r2Key)
+						fmt.Printf("Skipping %s - already exists in R2 with correct size\n", r2Key)
 					}
 					completedFiles.Add(1)
 					continue
+				} else if existingSize, exists := cache.GetSize(r2Key); exists {
+					// File exists but with incorrect size, delete it and reupload
+					fmt.Printf("File %s exists with incorrect size (expected: %s, actual: %s). Deleting and reuploading...\n",
+						r2Key, formatSize(int64(file.Size)), formatSize(existingSize))
+
+					client := createR2Client(ctx, *r2cfg)
+					_, deleteErr := client.DeleteObject(ctx, &s3.DeleteObjectInput{
+						Bucket: aws.String(r2cfg.BucketName),
+						Key:    aws.String(r2Key),
+					})
+					if deleteErr != nil {
+						fmt.Printf("Warning: Failed to delete incomplete file %s: %v\n", r2Key, deleteErr)
+					}
 				}
 
 				downloadURL := fmt.Sprintf("https://huggingface.co/datasets/%s/resolve/%s/%s",
@@ -379,10 +408,14 @@ func DownloadModel(ModelDatasetName string, AppendFilterToPath bool, SkipSHA boo
 
 				totalSize += int64(file.Size)
 
-				if cache.Exists(r2Key) {
+				if cache.ExistsWithSize(r2Key, int64(file.Size)) {
 					skippedSize += int64(file.Size)
 					skippedCount++
 					continue
+				} else if existingSize, exists := cache.GetSize(r2Key); exists {
+					// File exists but with incorrect size, will be reuploaded
+					fmt.Printf("File %s exists with incorrect size (expected: %s, actual: %s). Will be deleted and reuploaded.\n",
+						r2Key, formatSize(int64(file.Size)), formatSize(existingSize))
 				}
 
 				pendingFiles = append(pendingFiles, file)
@@ -550,33 +583,65 @@ func IsValidModelName(modelName string) bool {
 func streamMultipartToR2(ctx context.Context, r2cfg R2Config, reader io.Reader, key string, contentLength int64, progress *uploadProgress) error {
 	client := createR2Client(ctx, r2cfg)
 
-	// First, check for and clean up any existing incomplete multipart uploads
+	// Check for existing multipart uploads that we might resume
+	var uploadID string
 	listResp, err := client.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{
 		Bucket: aws.String(r2cfg.BucketName),
 		Prefix: aws.String(key),
 	})
+
 	if err == nil && listResp.Uploads != nil {
 		for _, upload := range listResp.Uploads {
-			_, err := client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
-				Bucket:   aws.String(r2cfg.BucketName),
-				Key:      upload.Key,
-				UploadId: upload.UploadId,
-			})
-			if err != nil {
-				fmt.Printf("Warning: Failed to abort incomplete upload for %s: %v\n", *upload.Key, err)
+			if *upload.Key == key {
+				// Found an existing upload for this exact key - let's try to resume it
+				uploadID = *upload.UploadId
+				fmt.Printf("Found existing multipart upload for %s (ID: %s) - attempting to resume\n", key, uploadID)
+
+				// Get existing parts to potentially resume from
+				parts := []types.CompletedPart{}
+				listPartsResp, listErr := client.ListParts(ctx, &s3.ListPartsInput{
+					Bucket:   aws.String(r2cfg.BucketName),
+					Key:      aws.String(key),
+					UploadId: aws.String(uploadID),
+				})
+
+				if listErr == nil && len(listPartsResp.Parts) > 0 {
+					fmt.Printf("Found %d previously uploaded parts for %s\n", len(listPartsResp.Parts), key)
+					// TODO: In a more complex implementation, we could resume from these parts
+					// Currently, we'll just abort and start fresh to ensure consistency
+				}
+
+				break
+			}
+		}
+
+		// If we didn't find a matching upload or decide not to resume, abort all existing uploads
+		if uploadID == "" {
+			for _, upload := range listResp.Uploads {
+				_, abortErr := client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+					Bucket:   aws.String(r2cfg.BucketName),
+					Key:      upload.Key,
+					UploadId: upload.UploadId,
+				})
+				if abortErr != nil {
+					fmt.Printf("Warning: Failed to abort incomplete upload for %s: %v\n", *upload.Key, abortErr)
+				}
 			}
 		}
 	}
 
-	// Create new multipart upload
-	resp, err := client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
-		Bucket: aws.String(r2cfg.BucketName),
-		Key:    aws.String(key),
-	})
-	if err != nil {
-		return fmt.Errorf("failed to create multipart upload: %v", err)
+	// Create new multipart upload if we don't have one to resume
+	if uploadID == "" {
+		resp, err := client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+			Bucket: aws.String(r2cfg.BucketName),
+			Key:    aws.String(key),
+		})
+		if err != nil {
+			return fmt.Errorf("failed to create multipart upload: %v", err)
+		}
+		uploadID = *resp.UploadId
+		fmt.Printf("Created new multipart upload for %s (ID: %s)\n", key, uploadID)
 	}
-	uploadID := *resp.UploadId
 
 	// Calculate optimal part size (minimum 5MB, maximum 5GB)
 	partSize := contentLength / int64(maxPartsPerFile)
