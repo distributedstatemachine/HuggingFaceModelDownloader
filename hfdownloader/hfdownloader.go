@@ -109,6 +109,40 @@ func (r *progressReader) Read(p []byte) (n int, err error) {
 	return
 }
 
+// custom httpClient to use our custom DNS resolver.
+var httpClient *http.Client
+
+func init() {
+	// To solve DNS timeout issues, and resolve faster, we use  cloudflare's DNS
+	r := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := &net.Dialer{Timeout: 5 * time.Second}
+			return d.DialContext(ctx, network, "1.1.1.1:53")
+		},
+	}
+
+	dialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Resolver:  r,
+	}
+
+	transport := &http.Transport{
+		DialContext:         dialer.DialContext,
+		TLSHandshakeTimeout: 10 * time.Second,
+		MaxIdleConns:        NumConnections,
+		MaxIdleConnsPerHost: NumConnections,
+		IdleConnTimeout:     30 * time.Second,
+		DisableKeepAlives:   false,
+	}
+
+	httpClient = &http.Client{
+		Transport: transport,
+		Timeout:   60 * time.Second,
+	}
+}
+
 func newProgressReader(reader io.Reader, progress *uploadProgress) io.Reader {
 	return &progressReader{
 		reader:   reader,
@@ -277,13 +311,12 @@ func DownloadModel(ModelDatasetName string, AppendFilterToPath bool, SkipSHA boo
 				req.Header.Add("User-Agent", "Mozilla/5.0")
 
 				// Download file
-				resp, err := http.DefaultClient.Do(req)
+				resp, err := httpClient.Do(req)
 				if err != nil {
 					fmt.Printf("Error downloading %s: %v\n", file.Path, err)
 					results <- fmt.Errorf("failed to download %s: %v", file.Path, err)
 					continue
 				}
-
 
 				if resp.StatusCode != http.StatusOK {
 					resp.Body.Close()
@@ -429,7 +462,6 @@ func processHFFolderTree(modelPath string, IsDataset bool, SkipSHA bool, ModelDa
 		fmt.Printf("📂 Found %d items in %s\n", len(files), folderName)
 	}
 
-
 	var parquetFiles []hfmodel
 	for _, file := range files {
 		if strings.HasSuffix(file.Path, ".parquet") && file.Size > 0 {
@@ -474,7 +506,7 @@ func fetchFileList(url string) ([]hfmodel, error) {
 	}
 	req.Header.Add("User-Agent", "Mozilla/5.0")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch file list: %v", err)
 	}
