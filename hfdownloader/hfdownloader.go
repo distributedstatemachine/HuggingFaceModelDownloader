@@ -598,7 +598,6 @@ func streamMultipartToR2(ctx context.Context, r2cfg R2Config, reader io.Reader, 
 				fmt.Printf("Found existing multipart upload for %s (ID: %s) - attempting to resume\n", key, uploadID)
 
 				// Get existing parts to potentially resume from
-				parts := []types.CompletedPart{}
 				listPartsResp, listErr := client.ListParts(ctx, &s3.ListPartsInput{
 					Bucket:   aws.String(r2cfg.BucketName),
 					Key:      aws.String(key),
