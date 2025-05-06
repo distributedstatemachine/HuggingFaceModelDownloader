@@ -2,3 +2,5 @@
 output/
 Models/
 Storage/
+
+**/.claude/settings.local.json

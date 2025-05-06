@@ -6,10 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
+	"math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -113,6 +116,9 @@ func (r *progressReader) Read(p []byte) (n int, err error) {
 var httpClient *http.Client
 
 func init() {
+	// Initialize random seed for jitter calculations
+	rand.Seed(time.Now().UnixNano())
+
 	// To solve DNS timeout issues, and resolve faster, we use  cloudflare's DNS
 	r := &net.Resolver{
 		PreferGo: true,
@@ -137,9 +143,11 @@ func init() {
 		DisableKeepAlives:   false,
 	}
 
+	// Set a longer timeout for the HTTP client (10 minutes)
+	// Individual requests will use context with their own timeouts
 	httpClient = &http.Client{
 		Transport: transport,
-		Timeout:   60 * time.Second,
+		Timeout:   10 * time.Minute,
 	}
 }
 
@@ -247,9 +255,113 @@ func (c *R2FileCache) GetSize(key string) (int64, bool) {
 	return size, exists
 }
 
+// DownloadState represents the current state of a model download
+type DownloadState struct {
+	ModelName      string          `json:"model_name"`
+	Branch         string          `json:"branch"`
+	TotalFiles     int             `json:"total_files"`
+	CompletedFiles map[string]bool `json:"completed_files"`
+	LastUpdate     time.Time       `json:"last_update"`
+	StartTime      time.Time       `json:"start_time"`
+}
+
+// saveDownloadState saves the current download state to a file
+func saveDownloadState(state *DownloadState, modelName string) error {
+	// Create state directory if it doesn't exist
+	stateDir := filepath.Join(os.TempDir(), "hfdownloader-state")
+	if err := os.MkdirAll(stateDir, 0755); err != nil {
+		return fmt.Errorf("failed to create state directory: %v", err)
+	}
+
+	// Create filename from sanitized model name
+	safeModelName := strings.ReplaceAll(modelName, "/", "_")
+	stateFile := filepath.Join(stateDir, fmt.Sprintf("%s.json", safeModelName))
+
+	// Update timestamp
+	state.LastUpdate = time.Now()
+
+	// Write state to file
+	file, err := os.Create(stateFile)
+	if err != nil {
+		return fmt.Errorf("failed to create state file: %v", err)
+	}
+	defer file.Close()
+
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(state); err != nil {
+		return fmt.Errorf("failed to encode state: %v", err)
+	}
+
+	return nil
+}
+
+// loadDownloadState loads the download state from a file
+func loadDownloadState(modelName string) (*DownloadState, error) {
+	// Create filename from sanitized model name
+	safeModelName := strings.ReplaceAll(modelName, "/", "_")
+	stateDir := filepath.Join(os.TempDir(), "hfdownloader-state")
+	stateFile := filepath.Join(stateDir, fmt.Sprintf("%s.json", safeModelName))
+
+	// Check if state file exists
+	if _, err := os.Stat(stateFile); os.IsNotExist(err) {
+		return nil, nil // No state file exists
+	}
+
+	// Read state file
+	file, err := os.Open(stateFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open state file: %v", err)
+	}
+	defer file.Close()
+
+	// Decode state
+	state := &DownloadState{
+		CompletedFiles: make(map[string]bool),
+	}
+	if err := json.NewDecoder(file).Decode(state); err != nil {
+		return nil, fmt.Errorf("failed to decode state: %v", err)
+	}
+
+	// Check if state is stale (older than 7 days)
+	if time.Since(state.LastUpdate) > 7*24*time.Hour {
+		os.Remove(stateFile) // Remove stale state file
+		return nil, nil
+	}
+
+	return state, nil
+}
+
 func DownloadModel(ModelDatasetName string, AppendFilterToPath bool, SkipSHA bool, IsDataset bool, DestinationBasePath string, ModelBranch string, concurrentConnections int, token string, silentMode bool, r2cfg *R2Config, skipLocal bool, hfPrefix string) error {
+	// Create a cancellable context with a 24-hour timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 24*time.Hour)
+	defer cancel()
+
+	// Load existing download state
+	downloadState, err := loadDownloadState(ModelDatasetName)
+	if err != nil {
+		fmt.Printf("Warning: Failed to load download state: %v\n", err)
+	}
+
+	// Initialize new state if needed
+	if downloadState == nil {
+		downloadState = &DownloadState{
+			ModelName:      ModelDatasetName,
+			Branch:         ModelBranch,
+			TotalFiles:     0,
+			CompletedFiles: make(map[string]bool),
+			StartTime:      time.Now(),
+			LastUpdate:     time.Now(),
+		}
+		fmt.Println("🆕 Starting new download session")
+	} else {
+		fmt.Printf("🔄 Resuming download from previous session (started %s)\n",
+			time.Since(downloadState.StartTime).Round(time.Minute))
+		fmt.Printf("💾 Previously completed: %d/%d files\n",
+			len(downloadState.CompletedFiles), downloadState.TotalFiles)
+	}
+
 	// Build cache of existing files
-	ctx := context.Background()
 	cache, err := buildR2Cache(ctx, r2cfg, r2cfg.Subfolder+"/")
 	if err != nil {
 		return fmt.Errorf("failed to build R2 cache: %v", err)
@@ -270,7 +382,18 @@ func DownloadModel(ModelDatasetName string, AppendFilterToPath bool, SkipSHA boo
 	for i := 0; i < maxWorkers; i++ {
 		wg.Add(1)
 		go func(workerID int) {
+			// Add panic recovery to prevent worker crashes from bringing down the entire process
+			defer func() {
+				if r := recover(); r != nil {
+					stack := make([]byte, 8192)
+					length := runtime.Stack(stack, false)
+					errMsg := fmt.Sprintf("❌ Worker %d panicked: %v\n%s", workerID, r, stack[:length])
+					fmt.Println(errMsg)
+					results <- fmt.Errorf("worker %d panicked: %v", workerID, r)
+				}
+			}()
 			defer wg.Done()
+
 			for file := range jobs {
 				if file.IsDirectory || file.FilterSkip || file.Size <= 0 || file.Path == "" {
 					completedFiles.Add(1)
@@ -326,8 +449,12 @@ func DownloadModel(ModelDatasetName string, AppendFilterToPath bool, SkipSHA boo
 
 				fmt.Printf("Worker %d: Starting download of %s\n", workerID, file.Path)
 
-				// Create request
-				req, err := http.NewRequest("GET", downloadURL, nil)
+				// Create download-specific context with longer timeout for large files (30 minutes)
+				downloadCtx, cancelDownload := context.WithTimeout(ctx, 30*time.Minute)
+				defer cancelDownload()
+
+				// Create request with context
+				req, err := http.NewRequestWithContext(downloadCtx, "GET", downloadURL, nil)
 				if err != nil {
 					fmt.Printf("Error creating request for %s: %v\n", file.Path, err)
 					results <- fmt.Errorf("failed to create request for %s: %v", file.Path, err)
@@ -339,18 +466,30 @@ func DownloadModel(ModelDatasetName string, AppendFilterToPath bool, SkipSHA boo
 				}
 				req.Header.Add("User-Agent", "Mozilla/5.0")
 
-				// Download file
-				resp, err := httpClient.Do(req)
-				if err != nil {
-					fmt.Printf("Error downloading %s: %v\n", file.Path, err)
-					results <- fmt.Errorf("failed to download %s: %v", file.Path, err)
-					continue
-				}
+				// Download file with retry logic
+				var resp *http.Response
+				downloadErr := retryWithBackoff(func() error {
+					var err error
+					resp, err = httpClient.Do(req)
+					if err != nil {
+						return fmt.Errorf("request failed: %v", err)
+					}
 
-				if resp.StatusCode != http.StatusOK {
-					resp.Body.Close()
-					fmt.Printf("Error downloading %s: status %d\n", file.Path, resp.StatusCode)
-					results <- fmt.Errorf("failed to download %s: status %d", file.Path, resp.StatusCode)
+					if resp.StatusCode != http.StatusOK {
+						bodyBytes, _ := io.ReadAll(resp.Body)
+						resp.Body.Close()
+						return fmt.Errorf("bad status: %d, body: %s", resp.StatusCode, string(bodyBytes))
+					}
+
+					return nil
+				}, 5, 1*time.Second, 30*time.Second)
+
+				if downloadErr != nil {
+					if resp != nil && resp.Body != nil {
+						resp.Body.Close()
+					}
+					fmt.Printf("Error downloading %s after retries: %v\n", file.Path, downloadErr)
+					results <- fmt.Errorf("failed to download %s: %v", file.Path, downloadErr)
 					continue
 				}
 
@@ -388,6 +527,15 @@ func DownloadModel(ModelDatasetName string, AppendFilterToPath bool, SkipSHA boo
 					continue
 				}
 
+				// Mark as completed in download state
+				downloadState.CompletedFiles[file.Path] = true
+				// Save download state periodically (every ~5 files)
+				if completedFiles.Load()%5 == 0 {
+					if err := saveDownloadState(downloadState, ModelDatasetName); err != nil {
+						fmt.Printf("Warning: Failed to save download state: %v\n", err)
+					}
+				}
+
 				completedFiles.Add(1)
 				fmt.Printf("✅ Worker %d: Successfully uploaded and verified %s\n", workerID, r2Key)
 			}
@@ -401,6 +549,26 @@ func DownloadModel(ModelDatasetName string, AppendFilterToPath bool, SkipSHA boo
 		skippedSize := int64(0)
 		skippedCount := 0
 
+		// Update total file count in download state
+		// Should only count files that need downloading
+		fileCount := 0
+		for _, file := range files {
+			if !file.IsDirectory && !file.FilterSkip && file.Size > 0 {
+				fileCount++
+			}
+		}
+
+		if downloadState.TotalFiles == 0 {
+			downloadState.TotalFiles = fileCount
+		} else {
+			downloadState.TotalFiles += fileCount
+		}
+
+		// Save state
+		if err := saveDownloadState(downloadState, ModelDatasetName); err != nil {
+			fmt.Printf("Warning: Failed to save download state: %v\n", err)
+		}
+
 		// First, filter files that need to be processed
 		for _, file := range files {
 			if !file.IsDirectory && !file.FilterSkip && file.Size > 0 {
@@ -408,7 +576,17 @@ func DownloadModel(ModelDatasetName string, AppendFilterToPath bool, SkipSHA boo
 
 				totalSize += int64(file.Size)
 
+				// Check if file is already in completed files list
+				if downloadState.CompletedFiles[file.Path] {
+					fmt.Printf("Skipping %s - marked as completed in saved state\n", file.Path)
+					skippedSize += int64(file.Size)
+					skippedCount++
+					continue
+				}
+
 				if cache.ExistsWithSize(r2Key, int64(file.Size)) {
+					// File exists in R2 with correct size - mark as completed
+					downloadState.CompletedFiles[file.Path] = true
 					skippedSize += int64(file.Size)
 					skippedCount++
 					continue
@@ -442,11 +620,54 @@ func DownloadModel(ModelDatasetName string, AppendFilterToPath bool, SkipSHA boo
 		}
 	}
 
+	// Start watchdog to monitor progress
+	stopWatchdog := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(2 * time.Minute) // Check progress every 2 minutes
+		defer ticker.Stop()
+
+		var lastCompleted int32
+		staleCount := 0
+
+		for {
+			select {
+			case <-ticker.C:
+				currentCompleted := completedFiles.Load()
+
+				if currentCompleted == lastCompleted && lastCompleted > 0 {
+					staleCount++
+					// Longer stale detection for large files (10 minutes = 5 checks)
+					fmt.Printf("⚠️ Warning: No progress detected for %d minutes\n", staleCount*2)
+
+					if staleCount >= 15 { // No progress for 30 minutes
+						fmt.Println("🔄 Progress appears to be stalled for too long!")
+						// We'll log this but not force cancel as it could be a very large file
+						staleCount = 0 // Reset to avoid multiple warnings
+					}
+				} else {
+					if lastCompleted > 0 {
+						fmt.Printf("📊 Progress update: %d files completed (+%d new)\n",
+							currentCompleted, currentCompleted-lastCompleted)
+					}
+					staleCount = 0
+					lastCompleted = currentCompleted
+				}
+			case <-stopWatchdog:
+				fmt.Println("🔍 Watchdog stopped - download completed or canceled")
+				return
+			}
+		}
+	}()
+
 	// Start processing
 	err = processHFFolderTree(modelPath, IsDataset, SkipSHA, ModelDatasetName, ModelBranch, "", silentMode, r2cfg, skipLocal, processFiles, hfPrefix)
 	if err != nil {
+		close(stopWatchdog)
 		return fmt.Errorf("error processing file tree: %v", err)
 	}
+
+	// Stop watchdog
+	close(stopWatchdog)
 
 	// Close jobs and wait
 	close(jobs)
@@ -460,7 +681,17 @@ func DownloadModel(ModelDatasetName string, AppendFilterToPath bool, SkipSHA boo
 	}
 
 	if len(errors) > 0 {
+		// Save state before returning error
+		if err := saveDownloadState(downloadState, ModelDatasetName); err != nil {
+			fmt.Printf("Warning: Failed to save download state: %v\n", err)
+		}
 		return fmt.Errorf("encountered errors: %v", errors)
+	}
+
+	// Save final state
+	fmt.Println("💾 Saving final download state")
+	if err := saveDownloadState(downloadState, ModelDatasetName); err != nil {
+		fmt.Printf("Warning: Failed to save final download state: %v\n", err)
 	}
 
 	return nil
@@ -529,7 +760,11 @@ func processHFFolderTree(modelPath string, IsDataset bool, SkipSHA bool, ModelDa
 
 // Helper function to fetch and parse file list
 func fetchFileList(url string) ([]hfmodel, error) {
-	req, err := http.NewRequest("GET", url, nil)
+	// Create a context with timeout for the API request (2 minutes should be plenty)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %v", err)
 	}
@@ -539,20 +774,36 @@ func fetchFileList(url string) ([]hfmodel, error) {
 	}
 	req.Header.Add("User-Agent", "Mozilla/5.0")
 
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch file list: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("failed to fetch file list, status: %d, body: %s", resp.StatusCode, string(body))
-	}
-
+	var resp *http.Response
 	var files []hfmodel
-	if err := json.NewDecoder(resp.Body).Decode(&files); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %v", err)
+
+	// Use retry with backoff for API requests
+	fetchErr := retryWithBackoff(func() error {
+		var err error
+		resp, err = httpClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("request failed: %v", err)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return fmt.Errorf("bad status: %d, body: %s", resp.StatusCode, string(bodyBytes))
+		}
+
+		// Decode response
+		files = []hfmodel{}
+		if err := json.NewDecoder(resp.Body).Decode(&files); err != nil {
+			resp.Body.Close()
+			return fmt.Errorf("failed to decode response: %v", err)
+		}
+
+		resp.Body.Close()
+		return nil
+	}, 5, 1*time.Second, 10*time.Second)
+
+	if fetchErr != nil {
+		return nil, fmt.Errorf("failed to fetch file list after retries: %v", fetchErr)
 	}
 
 	return files, nil
@@ -1054,6 +1305,74 @@ func CleanupCorruptedFiles(ctx context.Context, r2cfg *R2Config, prefix string, 
 }
 
 // Add this helper function to hfdownloader/hfdownloader.go
+// Helper function to determine if an error is transient and retryable
+func isTransientError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Check for network timeouts and temporary failures
+	if netErr, ok := err.(net.Error); ok && (netErr.Timeout() || netErr.Temporary()) {
+		return true
+	}
+
+	// Check for HTTP retryable status codes
+	errStr := err.Error()
+	if strings.Contains(errStr, "status 429") || // Too Many Requests
+		strings.Contains(errStr, "status 500") || // Internal Server Error
+		strings.Contains(errStr, "status 502") || // Bad Gateway
+		strings.Contains(errStr, "status 503") || // Service Unavailable
+		strings.Contains(errStr, "status 504") { // Gateway Timeout
+		return true
+	}
+
+	// Check for common AWS S3/R2 retryable errors
+	if strings.Contains(errStr, "RequestTimeout") ||
+		strings.Contains(errStr, "SlowDown") ||
+		strings.Contains(errStr, "InternalError") ||
+		strings.Contains(errStr, "connection reset") ||
+		strings.Contains(errStr, "EOF") ||
+		strings.Contains(errStr, "broken pipe") {
+		return true
+	}
+
+	return false
+}
+
+// Retry an operation with exponential backoff
+func retryWithBackoff(operation func() error, maxRetries int, initialBackoff, maxBackoff time.Duration) error {
+	var err error
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		err = operation()
+		if err == nil {
+			return nil
+		}
+
+		if !isTransientError(err) {
+			return fmt.Errorf("permanent error (not retrying): %v", err)
+		}
+
+		if attempt == maxRetries-1 {
+			break // Last attempt failed, exit loop
+		}
+
+		// Calculate backoff with jitter
+		backoff := time.Duration(float64(initialBackoff) * math.Pow(2, float64(attempt)))
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+		// Add jitter (±20%)
+		jitter := time.Duration(float64(backoff) * (0.8 + 0.4*rand.Float64()))
+
+		fmt.Printf("Retrying operation after %v (attempt %d/%d): %v\n",
+			jitter.Round(time.Millisecond), attempt+1, maxRetries, err)
+		time.Sleep(jitter)
+	}
+
+	return fmt.Errorf("operation failed after %d retries: %v", maxRetries, err)
+}
+
 func verifyRemoteFileChecksum(ctx context.Context, r2cfg *R2Config, key string, expectedChecksum string) error {
 	client := createR2Client(ctx, *r2cfg)
 	obj, err := client.GetObject(ctx, &s3.GetObjectInput{
