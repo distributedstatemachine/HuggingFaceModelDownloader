@@ -332,7 +332,7 @@ func loadDownloadState(modelName string) (*DownloadState, error) {
 	return state, nil
 }
 
-func DownloadModel(ModelDatasetName string, AppendFilterToPath bool, SkipSHA bool, IsDataset bool, DestinationBasePath string, ModelBranch string, concurrentConnections int, token string, silentMode bool, r2cfg *R2Config, skipLocal bool, hfPrefix string) error {
+func DownloadModel(ModelDatasetName string, AppendFilterToPath bool, SkipSHA bool, IsDataset bool, DestinationBasePath string, ModelBranch string, concurrentConnections int, token string, silentMode bool, r2cfg *R2Config, skipLocal bool, hfPrefix string, maxWorkers int) error {
 	// Create a cancellable context with a 24-hour timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 24*time.Hour)
 	defer cancel()
@@ -373,7 +373,12 @@ func DownloadModel(ModelDatasetName string, AppendFilterToPath bool, SkipSHA boo
 	// Create R2 client for checking existing files
 	// r2Client := createR2Client(ctx, *r2cfg)
 
-	maxWorkers := 16
+	// Use the provided maxWorkers parameter with a safety check
+	if maxWorkers <= 0 {
+		maxWorkers = 16 // Default to 16 if an invalid value is provided
+	}
+	fmt.Printf("Using %d worker goroutines for parallel downloads\n", maxWorkers)
+
 	jobs := make(chan hfmodel, maxWorkers)
 	results := make(chan error, maxWorkers)
 	var wg sync.WaitGroup

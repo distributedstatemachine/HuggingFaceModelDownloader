@@ -45,6 +45,7 @@ type Config struct {
 	SkipLocal     bool   `json:"skip_local"`
 	R2Subfolder   string `json:"r2_subfolder"`
 	HFPrefix      string `json:"hf_prefix"`
+	MaxWorkers    int    `json:"max_workers"`   // Maximum number of worker goroutines
 }
 
 // DefaultConfig returns a config instance populated with default values.
@@ -56,6 +57,7 @@ func DefaultConfig() Config {
 		MaxRetries:     3,
 		RetryInterval:  5,
 		R2Subfolder:    "hf_dataset",
+		MaxWorkers:     16, // Default to 16 worker goroutines
 	}
 }
 
@@ -255,6 +257,7 @@ func main() {
 					r2cfg,                     // R2 config
 					config.SkipLocal,          // skipLocal - use SkipLocal flag
 					config.HFPrefix,           // HF prefix
+					config.MaxWorkers,         // max workers for parallel downloads
 				); err != nil {
 					fmt.Printf("Warning: attempt %d / %d failed, error: %s\n", i+1, config.MaxRetries, err)
 					time.Sleep(time.Duration(config.RetryInterval) * time.Second)
@@ -272,7 +275,7 @@ func main() {
 	rootCmd.PersistentFlags().StringVarP(&config.DatasetName, "dataset", "d", config.DatasetName, "Dataset name to download")
 	rootCmd.PersistentFlags().StringVarP(&config.Branch, "branch", "b", config.Branch, "Branch of the model or dataset")
 	rootCmd.PersistentFlags().StringVarP(&config.Storage, "storage", "s", config.Storage, "Storage path for downloads")
-	rootCmd.PersistentFlags().IntVarP(&config.NumConnections, "concurrent", "c", config.NumConnections, "Number of concurrent connections")
+	rootCmd.PersistentFlags().IntVarP(&config.MaxWorkers, "concurrent", "c", config.MaxWorkers, "Number of concurrent download workers")
 	rootCmd.PersistentFlags().StringVarP(&config.AuthToken, "token", "t", config.AuthToken, "HuggingFace Auth Token")
 	rootCmd.PersistentFlags().BoolVarP(&config.OneFolderPerFilter, "appendFilterFolder", "f", config.OneFolderPerFilter, "Append filter name to folder")
 	rootCmd.PersistentFlags().BoolVarP(&config.SkipSHA, "skipSHA", "k", config.SkipSHA, "Skip SHA256 hash check")
